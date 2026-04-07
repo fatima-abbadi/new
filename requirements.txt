@@ -1,6 +1,6 @@
 streamlit
 pandas
+numpy
 matplotlib
-groq
 scikit-learn
-nltk
+groq
