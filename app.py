@@ -1,184 +1,155 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import numpy as np
 import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 # تحميل NLP
 nlp = spacy.load("en_core_web_sm")
 
-st.set_page_config(page_title="AI CS Analyzer Pro", layout="wide")
+st.set_page_config(layout="wide")
 st.title("🎓 AI CS Analyzer Pro")
 
-# =============================
-# 🧠 NLP: تنظيف النص
-# =============================
-def preprocess(text):
-    doc = nlp(str(text).lower())
-    return " ".join([t.lemma_ for t in doc if not t.is_stop and t.is_alpha])
+# ========= Helpers =========
 
-# =============================
-# 🎯 تجاهل الأعمدة الغلط
-# =============================
-IGNORE_COLUMNS = ["rank", "id", "student", "name"]
+def classify(avg, weak_t, avg_t):
+    if avg < weak_t:
+        return "Weak"
+    elif avg < avg_t:
+        return "Average"
+    return "Good"
 
-def filter_courses(columns):
-    valid = []
-    for col in columns:
-        if any(x in col.lower() for x in IGNORE_COLUMNS):
-            continue
-        valid.append(col)
-    return valid
+def difficulty_index(series, threshold):
+    return (series < threshold).sum() / len(series)
 
-# =============================
-# 📚 Resources (ذكية)
-# =============================
-RESOURCES = {
-    "programming": {
-        "yt": ["Python Full Course - freeCodeCamp", "CS50 Harvard"],
-        "practice": ["https://leetcode.com", "https://hackerrank.com"],
-        "tips": ["Practice daily", "Build small projects"]
-    },
-    "algorithms": {
-        "yt": ["Abdul Bari Algorithms", "MIT Algorithms"],
-        "practice": ["https://codeforces.com"],
-        "tips": ["Focus on DP & greedy", "Solve contests"]
-    },
-    "network": {
-        "yt": ["Networking - Cisco", "Gate Smashers"],
-        "practice": ["https://packettracerlabs.com"],
-        "tips": ["Use simulators", "Practice protocols"]
+# NLP استخراج كلمات
+def extract_keywords(text):
+    doc = nlp(text.lower())
+    return [token.lemma_ for token in doc if token.is_alpha and not token.is_stop]
+
+# توصيات جاهزة (مهم 🔥)
+COURSE_RESOURCES = {
+    "operating": {
+        "youtube": [
+            "https://www.youtube.com/watch?v=26QPDBe-NB8",
+            "https://www.youtube.com/watch?v=6i2C0Q3Y4Xw"
+        ],
+        "practice": [
+            "https://leetcode.com/problemset/",
+            "https://hackerrank.com/domains/os"
+        ],
+        "tips": [
+            "Focus on process scheduling",
+            "Use OS simulators",
+            "Mini OS projects"
+        ]
     },
     "database": {
-        "yt": ["SQL Full Course", "Database Systems"],
-        "practice": ["https://sqlzoo.net"],
-        "tips": ["Practice queries", "Design ER diagrams"]
+        "youtube": [
+            "https://www.youtube.com/watch?v=HXV3zeQKqGY"
+        ],
+        "practice": [
+            "https://leetcode.com/problemset/database/"
+        ],
+        "tips": [
+            "Practice SQL queries",
+            "Work on real DB projects"
+        ]
+    },
+    "network": {
+        "youtube": [
+            "https://www.youtube.com/watch?v=qiQR5rTSshw"
+        ],
+        "practice": [
+            "https://hackerrank.com/domains/networking"
+        ],
+        "tips": [
+            "Use packet tracer",
+            "Simulate networks"
+        ]
     }
 }
 
-def detect_field(course):
-    c = course.lower()
-    if "program" in c:
-        return "programming"
-    if "algorithm" in c:
-        return "algorithms"
-    if "network" in c:
-        return "network"
-    if "data" in c:
-        return "database"
-    return "programming"
+def get_recommendations(course):
+    keywords = extract_keywords(course)
 
-# =============================
-# 📊 رفع البيانات
-# =============================
-file = st.file_uploader("Upload Student Dataset", type="csv")
+    for key in COURSE_RESOURCES:
+        if key in keywords:
+            return COURSE_RESOURCES[key]
 
-if file:
-    df = pd.read_csv(file)
+    # fallback عام
+    return {
+        "youtube": ["https://www.youtube.com/results?search_query=" + course],
+        "practice": [
+            "https://leetcode.com",
+            "https://hackerrank.com"
+        ],
+        "tips": [
+            "Increase practical exercises",
+            "Use real-world projects"
+        ]
+    }
 
-    st.success(f"Loaded {len(df)} rows")
+# ========= UI =========
 
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    numeric_cols = filter_courses(numeric_cols)
+uploaded = st.file_uploader("Upload CSV", type="csv")
 
-    courses = st.multiselect("Select Courses", numeric_cols, default=numeric_cols)
+if uploaded:
+    df = pd.read_csv(uploaded)
 
-    final_col = st.selectbox("Final Grade Column", numeric_cols)
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
 
-    weak = st.slider("Weak <", 40, 70, 60)
-    avg  = st.slider("Average <", 60, 90, 75)
+    selected = st.multiselect("Select Courses", numeric_cols, default=numeric_cols)
+
+    weak_t = st.slider("Weak <", 40, 70, 60)
+    avg_t  = st.slider("Average <", 60, 90, 75)
 
     if st.button("Analyze"):
 
-        avg_scores = df[courses].mean().sort_values()
+        results = []
 
-        weak_c   = avg_scores[avg_scores < weak]
-        med_c    = avg_scores[(avg_scores >= weak) & (avg_scores < avg)]
-        good_c   = avg_scores[avg_scores >= avg]
+        for col in selected:
+            avg = df[col].mean()
+            std = df[col].std()
+            diff = difficulty_index(df[col], weak_t)
 
-        st.subheader("📊 Classification")
+            level = classify(avg, weak_t, avg_t)
 
-        st.write("🔴 Weak:", list(weak_c.index))
-        st.write("🟡 Average:", list(med_c.index))
-        st.write("🟢 Good:", list(good_c.index))
+            results.append({
+                "course": col,
+                "avg": avg,
+                "std": std,
+                "difficulty": diff,
+                "level": level
+            })
 
-        # =============================
-        # 📈 Plotly
-        # =============================
-        fig = px.bar(
-            x=avg_scores.values,
-            y=avg_scores.index,
-            orientation='h',
-            title="Course Performance"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        res_df = pd.DataFrame(results).sort_values("avg")
 
-        # =============================
-        # 🎯 Recommendations
-        # =============================
-        st.subheader("🎯 Smart Recommendations")
+        st.dataframe(res_df)
 
-        for course, val in avg_scores.items():
+        st.divider()
 
-            if val < weak:
-                level = "🔴"
-                label = "ضعيف"
-            elif val < avg:
-                level = "🟡"
-                label = "متوسط"
+        # ========= عرض احترافي =========
+        for _, row in res_df.iterrows():
+
+            if row["level"] == "Weak":
+                st.error(f"🔴 {row['course']} (ضعيف)")
+            elif row["level"] == "Average":
+                st.warning(f"🟡 {row['course']} (متوسط)")
             else:
-                level = "🟢"
-                label = "جيد"
+                st.success(f"🟢 {row['course']} (جيد)")
 
-            st.markdown(f"### {level} {course} ({label})")
+            rec = get_recommendations(row["course"])
 
-            field = detect_field(course)
-            res = RESOURCES[field]
+            st.markdown("🎥 YouTube:")
+            for y in rec["youtube"]:
+                st.write(f"- {y}")
 
-            st.write("🎥 YouTube:")
-            for y in res["yt"]:
-                st.write("-", y)
+            st.markdown("💻 Practice:")
+            for p in rec["practice"]:
+                st.write(f"- {p}")
 
-            st.write("💻 Practice:")
-            for p in res["practice"]:
-                st.write("-", p)
+            st.markdown("📌 تحسين التدريس:")
+            for t in rec["tips"]:
+                st.write(f"- {t}")
 
-            st.write("📌 تحسين:")
-            for t in res["tips"]:
-                st.write("-", t)
-
-        # =============================
-        # 💼 Job Roles Prediction
-        # =============================
-        st.subheader("💼 Predicted Job Roles")
-
-        roles = []
-
-        for course in courses:
-            field = detect_field(course)
-            if field == "programming":
-                roles.append("Software Engineer")
-            elif field == "algorithms":
-                roles.append("Competitive Programmer")
-            elif field == "network":
-                roles.append("Network Engineer")
-            elif field == "database":
-                roles.append("Data Analyst")
-
-        roles = list(set(roles))
-        st.write("🎯 Suitable Jobs:", roles)
-
-        # =============================
-        # 📊 TF-IDF (NLP)
-        # =============================
-        st.subheader("🧠 NLP Skill Extraction")
-
-        text_data = " ".join(courses)
-        processed = preprocess(text_data)
-
-        vectorizer = TfidfVectorizer()
-        X = vectorizer.fit_transform([processed])
-
-        features = vectorizer.get_feature_names_out()
-
-        st.write("Top Keywords:", list(features[:10]))
+            st.divider()
