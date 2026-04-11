@@ -898,7 +898,7 @@ with tab3:
         st.info("Complete both Tab 1 and Tab 2 to unlock the combined report. Each tab also generates its own independent report.")
         st.stop()
 
-    # ── Both ready ──
+    # ── unpack session state ──
     wc   = st.session_state['weak_c']
     mc   = st.session_state['mid_c']
     top30= st.session_state['top30']
@@ -915,152 +915,396 @@ with tab3:
     at   = st.session_state['at']
     cc   = st.session_state['cc']
 
-    # Summary cards
+    # ── shared strings (used by multiple sub-tabs) ──
+    weak_detail = "\n".join([
+        f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%, rf_importance={imps.get(c,0):.3f}"
+        for c,v in wc.items()
+    ]) or "None"
+    mid_detail = "\n".join([
+        f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%"
+        for c,v in mc.items()
+    ]) or "None"
+    top5_imp = "\n".join([f"- {c}: {v:.3f}" for c,v in imps.head(5).items()])
+    top20_skills = "\n".join([
+        f"- {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}, coverage={d['job_coverage']:.1f}%"
+        for s,d in top30[:20]
+    ])
+
+    # ── Summary KPI bar (always visible) ──
     g1,g2,g3,g4,g5 = st.columns(5)
+    auc_display = f"{met['auc']*100:.1f}%" if met.get('auc') else "N/A"
     for col,(l,v) in zip([g1,g2,g3,g4,g5],[
         ("Students",     ns),
         ("Train/Test",   f"{ntr}/{nte}"),
         ("Weak Courses", len(wc)),
         ("Jobs Analyzed",nj),
-        ("F1",           f"{met['f1']*100:.1f}%")
+        ("F1 / AUC",     f"{met['f1']*100:.1f}% / {auc_display}"),
     ]):
-        col.markdown(f'<div class="metric-card"><div class="val" style="font-size:1.2rem">{v}</div><div class="lbl">{l}</div></div>', unsafe_allow_html=True)
+        col.markdown(f'<div class="metric-card"><div class="val" style="font-size:1.1rem">{v}</div><div class="lbl">{l}</div></div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # Metrics explanation
-    with st.expander("📐 How metrics were calculated"):
+    # ════════════════════════════════════════════
+    # SUB-TABS — كل قسم لحاله
+    # ════════════════════════════════════════════
+    r1, r2, r3, r4, r5 = st.tabs([
+        "📊 Overview & Metrics",
+        "🔴 Course Recommendations",
+        "💼 Market Gap Analysis",
+        "📚 New Courses to Add",
+        "🚀 Action Plan",
+    ])
+
+    # ────────────────────────────────────────────
+    # SUB-TAB 1 — Overview & Metrics
+    # ────────────────────────────────────────────
+    with r1:
+        st.markdown('<p class="sec">Overview — Student Data + Market Summary</p>', unsafe_allow_html=True)
+
+        # Student level distribution
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("#### 🎓 Student Distribution")
+            for level, color in [('Weak','box-red'),('Average','box-amber'),('Excellent','box-green')]:
+                n = cnt.get(level, 0)
+                pct = n/ns*100 if ns else 0
+                st.markdown(f'<div class="{color}"><b>{level}</b> — {n} students ({pct:.0f}%)</div>', unsafe_allow_html=True)
+
+            st.markdown("#### 🔴 Weak Courses")
+            if len(wc):
+                for c,v in wc.items():
+                    st.markdown(f'<div class="box-red"><b>{c}</b> — Avg:{v:.1f} · Fail:{fr.get(c,0):.1f}% · RF Imp:{imps.get(c,0):.3f}</div>', unsafe_allow_html=True)
+            else:
+                st.success("No weak courses.")
+
+        with col_r:
+            st.markdown("#### 💼 Top 10 Market Skills")
+            t_df = pd.DataFrame([
+                (s, d['category'], d['tfidf_score'], f"{d['job_coverage']:.1f}%")
+                for s,d in top30[:10]
+            ], columns=['Skill','Category','TF-IDF','Coverage'])
+            st.dataframe(t_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### 📐 How Metrics Were Calculated")
         st.markdown(f"""
-**Train/Test Split:**
-- 80% ({ntr} students) → train Random Forest
-- 20% ({nte} students) → evaluate (never seen during training)
-- Classification applied **after** split → no data leakage
+| Metric | Value | Formula | Meaning |
+|--------|-------|---------|---------|
+| Accuracy   | {met['acc']*100:.1f}%  | (TP+TN) / all         | Overall correct predictions |
+| Precision  | {met['prec']*100:.1f}% | TP / (TP+FP)          | Of predicted weak, how many truly weak |
+| Recall     | {met['rec']*100:.1f}%  | TP / (TP+FN)          | Of all weak, how many did we catch |
+| F1-Score   | {met['f1']*100:.1f}%   | 2·P·R / (P+R)         | Balance between precision & recall |
+| CV Acc.    | {met['cv']*100:.1f}%   | 5-fold mean           | Stability — not overfitting |
+| AUC-ROC    | {auc_display}          | Area under ROC (OvR)  | Quality regardless of threshold |
 
-**Random Forest:** handles small datasets, gives Feature Importance, appeared in 6/8 related studies.
+**Train/Test:** 80% ({ntr} students) train · 20% ({nte} students) test — classification applied after split (no leakage).
 
-| Metric | Value | Formula |
-|--------|-------|---------|
-| Accuracy   | {met['acc']*100:.1f}% | (TP+TN) / all |
-| Precision  | {met['prec']*100:.1f}% | TP / (TP+FP) |
-| Recall     | {met['rec']*100:.1f}% | TP / (TP+FN) |
-| F1-Score   | {met['f1']*100:.1f}% | 2·P·R/(P+R) |
-| CV Accuracy| {met['cv']*100:.1f}% | 5-fold mean |
-
-**TF-IDF NLP:** high score = skill appears often but is specific to certain job types (more signal than raw count).
+**TF-IDF:** ngram=(1,3) · sublinear_tf=True · min_df=2 · max_df=0.95 — stop words removed before vectorization.
         """)
 
-    # Weak courses
-    st.markdown("#### 🔴 Weak Courses")
-    if len(wc):
-        for c,v in wc.items():
-            st.markdown(
-                f'<div class="box-red"><b>{c}</b> — Avg:{v:.1f} · Fail:{fr.get(c,0):.1f}% · RF Importance:{imps.get(c,0):.3f}</div>',
-                unsafe_allow_html=True
-            )
+    # ────────────────────────────────────────────
+    # SUB-TAB 2 — Per-Course Recommendations
+    # ────────────────────────────────────────────
+    with r2:
+        st.markdown('<p class="sec">Per-Course AI Recommendations — one section per weak course</p>', unsafe_allow_html=True)
+        st.markdown('<div class="box-blue">Each weak course gets its own dedicated AI analysis: why students struggle, teaching improvements, learning resources, and market relevance.</div>', unsafe_allow_html=True)
 
-    # Top market skills
-    st.markdown("---")
-    st.markdown("#### 💼 Top 15 Market Skills")
-    t_df = pd.DataFrame([
-        (s, d['category'], d['tfidf_score'], d['job_coverage'], d['jobs_with'])
-        for s,d in top30[:15]
-    ], columns=['Skill','Category','TF-IDF Score','Job Coverage %','Jobs Mentioning'])
-    st.dataframe(t_df, use_container_width=True)
+        if not wc.empty if hasattr(wc, 'empty') else not len(wc):
+            st.success("✅ No weak courses in this dataset.")
+        else:
+            if not groq_key:
+                st.warning("⚠️ Add Groq API Key in the sidebar.")
+            else:
+                if st.button("🔍 Generate Per-Course Recommendations", key="b3_courses"):
+                    with st.spinner("Generating per-course analysis..."):
 
-    # ══════════════════════════════════════════
-    # COMBINED AI REPORT
-    # ══════════════════════════════════════════
-    st.markdown("---")
-    st.markdown("#### 🤖 Combined AI Institutional Report")
-    st.markdown('<div class="box-blue">The combined report cross-references weak courses with market skill demand to produce the most targeted curriculum improvement plan.</div>', unsafe_allow_html=True)
+                        prompt_courses = f"""You are a senior academic consultant. Write per-course recommendations for a CS department head.
 
-    if not groq_key:
-        st.error("⚠️ Add Groq API Key in the sidebar.")
-    else:
-        if st.button("🚀 Generate Combined Institutional Report", key="b3"):
-            with st.spinner("Generating combined report..."):
-
-                weak_detail = "\n".join([
-                    f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%, rf_importance={imps.get(c,0):.3f}"
-                    for c,v in wc.items()
-                ]) or "None"
-
-                mid_detail = "\n".join([
-                    f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%"
-                    for c,v in mc.items()
-                ]) or "None"
-
-                top5_imp = "\n".join([f"- {c}: {v:.3f}" for c,v in imps.head(5).items()])
-
-                top20_skills = "\n".join([
-                    f"- {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}, coverage={d['job_coverage']:.1f}%"
-                    for s,d in top30[:20]
-                ])
-
-                prompt_combined = f"""You are a senior academic consultant writing a formal institutional report for the Head of a Computer Science Department.
-
-=== STUDENT DATA ({ns} students) ===
-Random Forest: Train={ntr} | Test={nte}
-Accuracy={met['acc']*100:.1f}% | Precision={met['prec']*100:.1f}% | Recall={met['rec']*100:.1f}% | F1={met['f1']*100:.1f}% | CV={met['cv']*100:.1f}%
-Thresholds: Weak<{wt} | Average {wt}–{at} | Excellent>{at}
-Distribution: Weak={cnt.get('Weak',0)} | Average={cnt.get('Average',0)} | Excellent={cnt.get('Excellent',0)}
+=== DATA ===
+Students: {ns} | Thresholds: Weak<{wt} | Average {wt}–{at}
 
 WEAK COURSES:
 {weak_detail}
 
-MEDIUM COURSES:
-{mid_detail}
-
-TOP 5 MOST INFLUENTIAL (RF Importance):
+TOP 5 RF INFLUENTIAL COURSES:
 {top5_imp}
 
+TOP 20 MARKET SKILLS (TF-IDF):
+{top20_skills}
+
+=== INSTRUCTIONS ===
+For EACH weak course below, write a dedicated section with EXACTLY this structure:
+
+### [Exact Course Name] | Fail Rate: X% | RF Importance: X.XXX
+
+**Why students struggle:**
+2-3 specific reasons based on the course topic and fail rate.
+
+**3 Teaching Improvements:**
+1. [specific method for THIS course topic]
+2. [specific method for THIS course topic]
+3. [specific method for THIS course topic]
+
+**Learning Resources:**
+- YouTube: [2 real channel names focused on THIS topic with example playlist]
+- Practice: [1 specific platform + specific resource name]
+- Textbook: [1 well-known book for THIS exact topic]
+
+**Market Relevance:**
+Which TF-IDF skills from the job market data relate to this course? List them with their scores.
+
+**Priority:** Critical / High / Medium
+
+---
+
+Be specific. Use the actual course names. Different resources for each course."""
+
+                        result_courses = call_groq(groq_key, prompt_courses, max_tokens=2500)
+                        st.session_state['report_courses'] = result_courses
+
+                if 'report_courses' in st.session_state:
+                    st.markdown(st.session_state['report_courses'])
+                    st.download_button(
+                        "📥 Download Course Recommendations",
+                        data=st.session_state['report_courses'],
+                        file_name="course_recommendations.txt",
+                        mime="text/plain",
+                        key="dl_courses"
+                    )
+
+    # ────────────────────────────────────────────
+    # SUB-TAB 3 — Market Gap Analysis
+    # ────────────────────────────────────────────
+    with r3:
+        st.markdown('<p class="sec">Curriculum–Market Gap — what the market wants vs what we teach</p>', unsafe_allow_html=True)
+        st.markdown('<div class="box-blue">Cross-references TF-IDF skill demand with existing courses to identify gaps — skills in high demand but absent from the curriculum.</div>', unsafe_allow_html=True)
+
+        # Static gap table (no AI needed)
+        st.markdown("#### 💼 Full Market Skills vs Curriculum Coverage")
+        gap_rows = []
+        for s, d in top30[:20]:
+            # هل المهارة مغطاة؟ نبحث في أسماء المقررات
+            covered = any(
+                s.lower() in c.lower() or c.lower() in s.lower()
+                for c in cc
+            )
+            gap_rows.append({
+                'Skill':         s,
+                'Category':      d['category'],
+                'TF-IDF Score':  d['tfidf_score'],
+                'Job Coverage %':d['job_coverage'],
+                'In Curriculum': '✅ Yes' if covered else '❌ Gap',
+            })
+        gap_df = pd.DataFrame(gap_rows)
+        st.dataframe(gap_df, use_container_width=True, hide_index=True)
+
+        # Gap score summary
+        gaps_only = [r for r in gap_rows if r['In Curriculum'] == '❌ Gap']
+        covered   = [r for r in gap_rows if r['In Curriculum'] == '✅ Yes']
+        g1c, g2c = st.columns(2)
+        g1c.metric("Skills with Gap",    len(gaps_only), delta_color="inverse")
+        g2c.metric("Skills Covered",     len(covered))
+
+        st.markdown("---")
+        if not groq_key:
+            st.warning("⚠️ Add Groq API Key for AI gap analysis.")
+        else:
+            if st.button("🔍 Generate Gap Analysis Report", key="b3_gap"):
+                with st.spinner("Analysing curriculum-market gaps..."):
+
+                    prompt_gap = f"""You are a senior academic consultant. Write a curriculum-market gap analysis for a CS department.
+
+=== DATA ===
+CURRENT COURSES IN CURRICULUM:
+{', '.join(cc)}
+
+TOP 20 MARKET SKILLS (TF-IDF NLP from {nj} job listings):
+{top20_skills}
+
+=== INSTRUCTIONS ===
+Write a formal gap analysis with EXACTLY these sections:
+
+## Gap Analysis: Curriculum vs Market Demand
+
+### Skills in High Demand NOT Covered by Existing Courses
+List each gap skill with:
+- TF-IDF score and job coverage %
+- Why it matters for graduates
+- Which existing course could absorb it (if any) vs needs a new course
+
+### Skills Partially Covered (needs strengthening)
+List skills that exist in courses but at insufficient depth.
+
+### Skills Well Covered ✅
+Brief list of skills the curriculum already handles well.
+
+### Gap Score Summary
+Estimated % of top-20 market skills covered vs not covered.
+
+Be specific. Use actual course names and skill names from the data."""
+
+                    result_gap = call_groq(groq_key, prompt_gap, max_tokens=2000)
+                    st.session_state['report_gap'] = result_gap
+
+            if 'report_gap' in st.session_state:
+                st.markdown(st.session_state['report_gap'])
+                st.download_button(
+                    "📥 Download Gap Analysis",
+                    data=st.session_state['report_gap'],
+                    file_name="gap_analysis.txt",
+                    mime="text/plain",
+                    key="dl_gap"
+                )
+
+    # ────────────────────────────────────────────
+    # SUB-TAB 4 — New Courses to Add
+    # ────────────────────────────────────────────
+    with r4:
+        st.markdown('<p class="sec">New Courses — recommended additions based on market gap</p>', unsafe_allow_html=True)
+        st.markdown('<div class="box-blue">Based on TF-IDF skill demand and curriculum gaps, the AI recommends specific new courses to add — with market evidence for each.</div>', unsafe_allow_html=True)
+
+        if not groq_key:
+            st.warning("⚠️ Add Groq API Key in the sidebar.")
+        else:
+            if st.button("🔍 Generate New Course Recommendations", key="b3_newcourses"):
+                with st.spinner("Designing new course recommendations..."):
+
+                    prompt_new = f"""You are a senior academic consultant recommending new courses for a CS department.
+
+=== DATA ===
 CURRENT COURSES:
 {', '.join(cc)}
 
-=== JOB MARKET ({nj} listings, TF-IDF NLP) ===
-TOP 20 SKILLS BY TF-IDF:
+TOP 20 MARKET SKILLS (TF-IDF from {nj} jobs):
 {top20_skills}
 
-=== REPORT STRUCTURE ===
+WEAK COURSES IN CURRENT CURRICULUM:
+{weak_detail}
 
-## 1. Executive Summary
-Key numbers from both datasets. 3-4 sentences.
+=== INSTRUCTIONS ===
+Recommend exactly 5 new courses with EXACTLY this structure for each:
 
-## 2. Per-Course Recommendations
-For EACH weak course:
-### [Course Name]
-- **Why students struggle** (fail rate + RF importance analysis)
-- **3 Teaching improvements** specific to this course topic
-- **Learning Resources:** 2-3 real YouTube channels + 1 practice platform + 1 textbook
-- **Market relevance:** which TF-IDF skills relate to this course?
-- **Priority:** Critical / High
+---
+## Course [N]: [Course Name]
 
-## 3. Curriculum–Market Gap
-Skills with high TF-IDF NOT covered by existing courses. Ranked by TF-IDF score.
+**Skills Covered:**
+List 4-6 skills from the TF-IDF data this course would teach, with their scores.
 
-## 4. New Courses to Add
-4-5 courses with: skills covered, TF-IDF evidence, suggested semester, priority.
+**Market Evidence:**
+- TF-IDF total demand score for these skills
+- Job coverage % (how many job postings require these skills)
+- Growing / Stable / Declining trend
 
-## 5. Priority Action Plan
-Numbered, most urgent first. Timeline for each.
+**Why This Course Is Needed:**
+2-3 sentences linking the gap in current curriculum to market demand.
 
-Be specific. Use actual course names and skill scores from the data."""
+**Suggested Placement:** Year X, Semester Y (Required / Elective)
 
-                result_combined = call_groq(groq_key, prompt_combined, max_tokens=3500)
-                st.markdown(result_combined)
+**Prerequisites:** [existing courses from the curriculum]
 
-                # Download
-                report_txt = (
-                    f"CS DEPARTMENT — COMBINED INSTITUTIONAL REPORT\n{'='*60}\n\n"
-                    f"Students={ns} | Train={ntr} | Test={nte} | Jobs={nj}\n"
-                    f"Accuracy={met['acc']*100:.1f}% | F1={met['f1']*100:.1f}%\n\n"
+**Priority:** High / Medium / Low
+---
+
+Base recommendations on actual TF-IDF scores. Do not recommend courses already in the curriculum."""
+
+                    result_new = call_groq(groq_key, prompt_new, max_tokens=2000)
+                    st.session_state['report_new'] = result_new
+
+            if 'report_new' in st.session_state:
+                st.markdown(st.session_state['report_new'])
+                st.download_button(
+                    "📥 Download New Course Recommendations",
+                    data=st.session_state['report_new'],
+                    file_name="new_courses.txt",
+                    mime="text/plain",
+                    key="dl_new"
+                )
+
+    # ────────────────────────────────────────────
+    # SUB-TAB 5 — Action Plan
+    # ────────────────────────────────────────────
+    with r5:
+        st.markdown('<p class="sec">Priority Action Plan — what to do first, second, third</p>', unsafe_allow_html=True)
+        st.markdown('<div class="box-blue">A numbered action plan synthesising all findings: course fixes, new additions, and curriculum restructuring — with timelines.</div>', unsafe_allow_html=True)
+
+        if not groq_key:
+            st.warning("⚠️ Add Groq API Key in the sidebar.")
+        else:
+            if st.button("🚀 Generate Full Action Plan", key="b3_action"):
+                with st.spinner("Synthesising action plan..."):
+
+                    # جمع كل التقارير السابقة كـ context إذا موجودة
+                    prev_reports = ""
+                    if 'report_courses' in st.session_state:
+                        prev_reports += f"\n\nCOURSE RECOMMENDATIONS SUMMARY:\n{st.session_state['report_courses'][:800]}"
+                    if 'report_gap' in st.session_state:
+                        prev_reports += f"\n\nGAP ANALYSIS SUMMARY:\n{st.session_state['report_gap'][:800]}"
+                    if 'report_new' in st.session_state:
+                        prev_reports += f"\n\nNEW COURSES SUMMARY:\n{st.session_state['report_new'][:800]}"
+
+                    prompt_action = f"""You are a senior academic consultant. Write a priority action plan for a CS department head.
+
+=== DATA ===
+Students: {ns} | F1: {met['f1']*100:.1f}% | Jobs analysed: {nj}
+Weak courses ({len(wc)}): {', '.join(wc.index.tolist() if hasattr(wc,'index') else list(wc.keys()))}
+Top market skills: {', '.join([s for s,_ in top30[:10]])}
+Current courses: {', '.join(cc)}
+{prev_reports}
+
+=== INSTRUCTIONS ===
+Write a formal priority action plan with EXACTLY this structure:
+
+## Executive Summary
+3-4 sentences: key numbers and most critical finding.
+
+## Priority Action Plan
+
+### 🔴 IMMEDIATE (Next Semester)
+Numbered list of 3-4 actions. For each:
+- **Action:** what exactly to do
+- **Target:** which course or curriculum area
+- **Expected Impact:** measurable outcome
+- **Owner:** Department Head / Course Instructor / Curriculum Committee
+
+### 🟡 SHORT-TERM (Within 1 Year)
+Numbered list of 3-4 actions. Same format.
+
+### 🟢 MEDIUM-TERM (1–3 Years)
+Numbered list of 2-3 actions. Same format.
+
+## Success Metrics
+How to measure if the actions worked. Include:
+- Student performance targets (fail rate reduction %)
+- Curriculum coverage target (% of top-20 skills covered)
+- Timeline for first review
+
+Be specific. Reference actual course names and skill scores."""
+
+                    result_action = call_groq(groq_key, prompt_action, max_tokens=2000)
+                    st.session_state['report_action'] = result_action
+
+            if 'report_action' in st.session_state:
+                st.markdown(st.session_state['report_action'])
+
+                # Download كل التقارير مجتمعة
+                full_report = (
+                    f"CS DEPARTMENT — FULL INSTITUTIONAL REPORT\n{'='*60}\n\n"
+                    f"Students={ns} | Jobs={nj} | F1={met['f1']*100:.1f}%\n\n"
                     f"WEAK COURSES:\n{weak_detail}\n\n"
-                    f"TOP SKILLS (TF-IDF):\n{top20_skills}\n\n"
-                    f"{'='*60}\nAI RECOMMENDATIONS\n{'='*60}\n\n{result_combined}"
+                    f"TOP SKILLS:\n{top20_skills}\n\n"
+                    f"{'='*60}\n1. COURSE RECOMMENDATIONS\n{'='*60}\n"
+                    f"{st.session_state.get('report_courses','Not generated')}\n\n"
+                    f"{'='*60}\n2. GAP ANALYSIS\n{'='*60}\n"
+                    f"{st.session_state.get('report_gap','Not generated')}\n\n"
+                    f"{'='*60}\n3. NEW COURSES\n{'='*60}\n"
+                    f"{st.session_state.get('report_new','Not generated')}\n\n"
+                    f"{'='*60}\n4. ACTION PLAN\n{'='*60}\n"
+                    f"{st.session_state.get('report_action','Not generated')}"
                 )
                 st.download_button(
-                    "📥 Download Combined Report",
-                    data=report_txt,
-                    file_name="combined_institutional_report.txt",
-                    mime="text/plain"
+                    "📥 Download Full Report (All Sections)",
+                    data=full_report,
+                    file_name="full_institutional_report.txt",
+                    mime="text/plain",
+                    key="dl_full"
                 )
