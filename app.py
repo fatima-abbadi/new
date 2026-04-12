@@ -567,10 +567,16 @@ with tab1:
                 if st.button("📋 Generate Student Performance Report", key="b1_report"):
                     with st.spinner("Generating AI report..."):
 
+                        def shap_str_val(c):
+                            if shap_v is None:
+                                return "N/A"
+                            val = shap_v.get(c, 0)
+                            return f"{float(val):.4f}"
+
                         weak_str = "\n".join([
                             f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%, "
                             f"rf_importance={imps.get(c,0):.3f}, "
-                            f"shap={shap_v.get(c,0):.4f if shap_v is not None else 'N/A'}"
+                            f"shap={shap_str_val(c)}"
                             for c, v in wc.items()
                         ]) or "None"
 
