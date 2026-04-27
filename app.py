@@ -348,7 +348,7 @@ with tab1:
                 lr_pipe = make_pipeline(
                     StandardScaler(),
                     LogisticRegression(max_iter=1000, random_state=42,
-                                       class_weight='balanced', multi_class='auto'))
+                                       class_weight='balanced'))
                 lr_pipe.fit(Xtr, ytr)
                 ypr_lr   = lr_pipe.predict(Xte)
                 f1_lr    = f1_score(ypr_lr, yte, average='weighted', zero_division=0)
