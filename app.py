@@ -974,12 +974,27 @@ Combined → most complete skill demand signal.
                     })
                 gdf = pd.DataFrame(gap_rows)
                 st.dataframe(gdf, use_container_width=True, hide_index=True)
-                n_gaps  = sum(1 for r in gap_rows if '❌' in r['In Curriculum'])
-                g1, g2  = st.columns(2)
-                g1.metric("Skills with Gap", n_gaps,           delta_color="inverse")
+                n_gaps = sum(1 for r in gap_rows if '❌' in r['In Curriculum'])
+                g1, g2 = st.columns(2)
+                g1.metric("Skills with Gap", n_gaps,            delta_color="inverse")
                 g2.metric("Skills Covered",  len(gap_rows)-n_gaps)
 
-            # ── AI REPORT ──
+            # ══ حفظ نتائج Tab 2 في session_state ══
+            st.session_state['s2'] = {
+                'jobs_n':    len(jobs_df),
+                'skill_r':   skill_r,
+                'top30':     top30,
+                'cat_tot':   cat_tot,
+                'tot_all':   tot_all,
+                'has_bert':  has_bert,
+                'bert_status': bert_status,
+                'curr_in':   curr_in,
+            }
+            st.success("✅ NLP analysis complete — scroll down to generate the AI report.")
+
+        # ── AI REPORT — خارج if b2_run عشان ما يختفي ──
+        if 's2' in st.session_state:
+            s2 = st.session_state['s2']
             st.markdown("---")
             st.markdown("#### 🤖 AI Report — Job Market & Curriculum")
             st.markdown(
@@ -991,29 +1006,31 @@ Combined → most complete skill demand signal.
                 st.warning("⚠️ Add Groq API Key in the sidebar.")
             else:
                 if st.button("📋 Generate Job Market Report", key="b2_report"):
-                    with st.spinner("Generating AI report..."):
+                    top30    = s2['top30']
+                    cat_tot  = s2['cat_tot']
+                    tot_all  = s2['tot_all']
+                    skill_r  = s2['skill_r']
+                    has_bert = s2['has_bert']
+                    curr_in  = s2['curr_in']
 
+                    with st.spinner("Generating AI report..."):
                         top20_str = "\n".join([
                             f"- {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}, "
                             f"coverage={d['job_coverage']:.1f}%"
                             + (f", BERT={d['bert_sim']:.3f}" if d['bert_sim'] else "")
                             for s, d in top30[:20]
                         ])
-
                         cat_str = "\n".join([
                             f"- {cat}: {tot:.1f} ({int(tot/tot_all*100)}%)"
                             for cat, tot in sorted(
                                 cat_tot.items(), key=lambda x: x[1], reverse=True)
                         ])
-
-                        curr_str = curr_in.strip() if curr_in.strip() else "Not provided"
-
+                        curr_str  = curr_in.strip() if curr_in.strip() else "Not provided"
                         bert_note = ""
                         if has_bert:
                             top3b = sorted(
                                 [(s, d['bert_sim']) for s,d in skill_r.items() if d['bert_sim']],
-                                key=lambda x: x[1], reverse=True
-                            )[:5]
+                                key=lambda x: x[1], reverse=True)[:5]
                             bert_note = (f"\nTOP 5 BY BERT SEMANTIC SIMILARITY: "
                                          f"{', '.join([f'{s}({v:.3f})' for s,v in top3b])}")
 
@@ -1023,7 +1040,7 @@ report for the Head of a Computer Science Department.
 IMPORTANT: You are a report-generation tool. Use the numbers below accurately.
 Do not invent data. Present as evidence-based suggestions for expert review.
 
-=== JOB MARKET DATA ({len(jobs_df)} listings — TF-IDF + BERT NLP) ===
+=== JOB MARKET DATA ({s2['jobs_n']} listings — TF-IDF + BERT NLP) ===
 TOP 20 IN-DEMAND SKILLS:
 {top20_str}
 {bert_note}
@@ -1056,19 +1073,33 @@ Each: name · skills covered (TF-IDF scores) · placement (Year/Semester) · Pri
 Numbered, most urgent first. Include measurable targets."""
 
                         result_j = call_groq(groq_key, prompt_j, max_tokens=3000)
-                        st.markdown(result_j)
+                        st.session_state['s2_report'] = result_j
 
-                        report_j = (
-                            f"CS DEPARTMENT — JOB MARKET REPORT\n{'='*60}\n\n"
-                            f"Jobs={len(jobs_df)} | Skills={len(skill_r)} | BERT={bert_status}\n\n"
-                            f"TOP SKILLS:\n{top20_str}\n\nCATEGORIES:\n{cat_str}\n\n"
-                            f"{'='*60}\nAI REPORT\n{'='*60}\n\n{result_j}"
-                        )
-                        st.download_button(
-                            "📥 Download Job Market Report",
-                            data=report_j,
-                            file_name="job_market_report.txt",
-                            mime="text/plain"
-                        )
+                if 's2_report' in st.session_state:
+                    st.markdown(st.session_state['s2_report'])
+                    s2r = st.session_state['s2']
+                    top20_str_dl = "\n".join([
+                        f"- {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}"
+                        for s, d in s2r['top30'][:20]
+                    ])
+                    cat_str_dl = "\n".join([
+                        f"- {cat}: {tot:.1f}"
+                        for cat, tot in sorted(
+                            s2r['cat_tot'].items(), key=lambda x: x[1], reverse=True)
+                    ])
+                    report_j = (
+                        f"CS DEPARTMENT — JOB MARKET REPORT\n{'='*60}\n\n"
+                        f"Jobs={s2r['jobs_n']} | Skills={len(s2r['skill_r'])} | "
+                        f"BERT={s2r['bert_status']}\n\n"
+                        f"TOP SKILLS:\n{top20_str_dl}\n\nCATEGORIES:\n{cat_str_dl}\n\n"
+                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n{st.session_state['s2_report']}"
+                    )
+                    st.download_button(
+                        "📥 Download Job Market Report",
+                        data=report_j,
+                        file_name="job_market_report.txt",
+                        mime="text/plain",
+                        key="dl_s2"
+                    )
     else:
         st.info("📂 Upload a job listings CSV to begin.")
