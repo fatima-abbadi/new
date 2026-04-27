@@ -124,20 +124,32 @@ def compute_auc(model, X_te, y_te, classes):
     except Exception:
         return None
 
-# ── FIX 3: SHAP على عيّنة محدودة — يستقبل DataFrame مباشرة ──
+# ── SHAP: يعمل على numpy array لتجنب مشاكل الـ index ──
 def compute_shap(model, X_te_df, features):
     """
     SHAP على max 50 عيّنة من Test Set.
-    يستقبل DataFrame للحفاظ على أسماء الأعمدة.
+    يتعامل مع multi-class و binary بشكل صحيح.
     """
     try:
-        sample = X_te_df.iloc[:min(50, len(X_te_df))]
+        arr = np.array(X_te_df.values[:min(50, len(X_te_df))], dtype=float)
         exp = shap.TreeExplainer(model)
-        sv  = exp.shap_values(sample)
-        ma  = np.mean([np.abs(s) for s in sv], axis=0) if isinstance(sv, list) else np.abs(sv)
-        return pd.Series(ma.mean(axis=0), index=features).sort_values(ascending=False)
-    except Exception:
-        return None
+        sv  = exp.shap_values(arr)
+        # sv شكله مختلف حسب نوع المشكلة:
+        # multi-class (list): [array(n,f), array(n,f), array(n,f)] - واحد لكل كلاس
+        # binary (array): array(n,f) أو array(n,f,2)
+        if isinstance(sv, list):
+            # نأخذ mean absolute عبر كل الكلاسات ثم عبر الـ samples
+            stacked = np.stack([np.abs(s) for s in sv], axis=0)  # (n_classes, n_samples, n_features)
+            mean_shap = stacked.mean(axis=0).mean(axis=0)         # (n_features,)
+        elif sv.ndim == 3:
+            # array(n_samples, n_features, n_classes)
+            mean_shap = np.abs(sv).mean(axis=0).mean(axis=1)      # (n_features,)
+        else:
+            # binary: array(n_samples, n_features)
+            mean_shap = np.abs(sv).mean(axis=0)                   # (n_features,)
+        return pd.Series(mean_shap, index=features).sort_values(ascending=False)
+    except Exception as e:
+        return str(e)
 
 def call_groq(key, prompt, max_tokens=2500):
     try:
@@ -496,7 +508,7 @@ with tab1:
 
             with sh_c:
                 st.markdown("**SHAP Values — mean |SHAP|**")
-                if shap_v is not None:
+                if shap_v is not None and not isinstance(shap_v, str):
                     ts = shap_v.sort_values(ascending=True)
                     fig5, ax5 = dark_fig((7, max(4, len(course_cols)*.4)))
                     ax5.barh(ts.index, ts.values,
@@ -505,6 +517,8 @@ with tab1:
                     ax5.axvline(shap_v.mean(), color='#d97706', linestyle='--', lw=1)
                     ax5.set_title('SHAP (sampled on test set)', color='#94a3b8', fontsize=8)
                     plt.tight_layout(); st.pyplot(fig5); plt.close()
+                elif isinstance(shap_v, str):
+                    st.warning(f"SHAP error: {shap_v}")
                 else:
                     st.info("SHAP not available.")
 
@@ -595,6 +609,8 @@ This prevents any statistical leakage from test-set rows into the clustering sca
 
             # ══ حفظ كل النتائج في session_state ══
             # هذا يحل مشكلة ضياع النتائج عند الضغط على Generate Report
+            # نحفظ shap_v فقط إذا كانت Series حقيقية
+            shap_to_save = shap_v if (shap_v is not None and isinstance(shap_v, pd.Series)) else None
             st.session_state['s1'] = {
                 'df': df, 'avgs': avgs, 'fr': fr,
                 'wc': wc, 'mc': mc, 'gc': gc,
@@ -603,7 +619,7 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                 'Xtr': Xtr, 'Xte': Xte, 'ytr': ytr, 'yte': yte, 'ypr': ypr,
                 'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1,
                 'cv': cv, 'auc': auc, 'imps': imps,
-                'shap_v': shap_v, 'best_cw_label': best_cw_label,
+                'shap_v': shap_to_save, 'best_cw_label': best_cw_label,
                 'best_k': best_k, 'best_sil': max(silhs),
                 'lmap': lmap, 'ks': list(ks),
                 'inert': inert, 'silhs': silhs,
