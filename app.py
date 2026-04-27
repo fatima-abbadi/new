@@ -86,8 +86,10 @@ with st.sidebar:
     max_k = st.slider("Max clusters to test:", 3, 8, 6)
     st.markdown("---")
     st.markdown("**Tab 2 — Job Market:**")
-    bert_on   = st.toggle("Enable BERT (Sentence-BERT)", value=False)
-    bert_name = st.selectbox("BERT model:", ["all-MiniLM-L6-v2", "all-mpnet-base-v2"], index=0)
+    bert_on        = st.toggle("Enable BERT (Sentence-BERT)", value=False)
+    bert_name      = st.selectbox("BERT model:", ["all-MiniLM-L6-v2", "all-mpnet-base-v2"], index=0)
+    bert_threshold = st.slider("BERT similarity threshold:", 0.30, 0.70, 0.45, 0.05,
+                               help="Job considered to mention a skill if cosine similarity ≥ threshold")
     st.caption("Requires: pip install sentence-transformers")
     st.markdown("---")
     st.markdown("**Each tab is independent.**")
@@ -127,29 +129,34 @@ def compute_auc(model, X_te, y_te, classes):
 # ── SHAP: يعمل على numpy array لتجنب مشاكل الـ index ──
 def compute_shap(model, X_te_df, features):
     """
-    SHAP على max 50 عيّنة من Test Set.
-    يتعامل مع multi-class و binary بشكل صحيح.
+    يرجع (mean_abs_shap, mean_signed_shap):
+    - mean_abs  → حجم التأثير  (للرسمة الرئيسية)
+    - mean_sign → اتجاه التأثير (موجب = يرفع النجاح، سالب = يخفضه)
     """
     try:
         arr = np.array(X_te_df.values[:min(50, len(X_te_df))], dtype=float)
         exp = shap.TreeExplainer(model)
         sv  = exp.shap_values(arr)
-        # sv شكله مختلف حسب نوع المشكلة:
-        # multi-class (list): [array(n,f), array(n,f), array(n,f)] - واحد لكل كلاس
-        # binary (array): array(n,f) أو array(n,f,2)
         if isinstance(sv, list):
-            # نأخذ mean absolute عبر كل الكلاسات ثم عبر الـ samples
-            stacked = np.stack([np.abs(s) for s in sv], axis=0)  # (n_classes, n_samples, n_features)
-            mean_shap = stacked.mean(axis=0).mean(axis=0)         # (n_features,)
+            # multi-class: list of (n_samples, n_features) per class
+            # نأخذ آخر كلاس (Excellent/highest) لحساب الـ direction
+            stacked  = np.stack([np.abs(s) for s in sv], axis=0)
+            mean_abs = stacked.mean(axis=0).mean(axis=0)          # (n_features,)
+            # direction: SHAP للكلاس الأعلى (Excellent)
+            last_cls = sv[-1]                                      # (n_samples, n_features)
+            mean_sign = last_cls.mean(axis=0)                      # (n_features,)
         elif sv.ndim == 3:
-            # array(n_samples, n_features, n_classes)
-            mean_shap = np.abs(sv).mean(axis=0).mean(axis=1)      # (n_features,)
+            # (n_samples, n_features, n_classes)
+            mean_abs  = np.abs(sv).mean(axis=0).mean(axis=1)      # (n_features,)
+            mean_sign = sv[:, :, -1].mean(axis=0)                  # direction لآخر كلاس
         else:
-            # binary: array(n_samples, n_features)
-            mean_shap = np.abs(sv).mean(axis=0)                   # (n_features,)
-        return pd.Series(mean_shap, index=features).sort_values(ascending=False)
+            mean_abs  = np.abs(sv).mean(axis=0)
+            mean_sign = sv.mean(axis=0)
+        abs_s  = pd.Series(mean_abs,  index=features).sort_values(ascending=False)
+        sign_s = pd.Series(mean_sign, index=features)
+        return abs_s, sign_s
     except Exception as e:
-        return str(e)
+        return str(e), None
 
 def call_groq(key, prompt, max_tokens=2500):
     try:
@@ -314,22 +321,38 @@ with tab1:
             ytr = ytr_r.apply(classify)
             yte = yte_r.apply(classify)
 
-            # ── FIX 2: Compare balanced vs default — choose by F1 ──
-            with st.spinner("Training Random Forest (comparing class_weight options)..."):
-                best_rf, best_f1_cw, best_cw_label = None, -1, ""
+            # ── class_weight: اختيار بـ CV على Train فقط (بدون لمس Test) ──
+            with st.spinner("Training models (RF + LR baseline)..."):
+                best_cw_label = 'balanced'
+                best_cv_f1    = -1
                 for cw, cw_label in [('balanced', 'balanced'), (None, 'none')]:
-                    rf_tmp = RandomForestClassifier(
+                    rf_tmp  = RandomForestClassifier(
                         n_estimators=100, random_state=42, class_weight=cw)
-                    rf_tmp.fit(Xtr, ytr)
-                    ypr_tmp = rf_tmp.predict(Xte)
-                    f1_tmp  = f1_score(ypr_tmp, yte, average='weighted', zero_division=0)
-                    if f1_tmp > best_f1_cw:
-                        best_f1_cw   = f1_tmp
-                        best_rf      = rf_tmp
+                    cv_f1 = cross_val_score(
+                        rf_tmp, Xtr, ytr, cv=5,
+                        scoring='f1_weighted').mean()
+                    if cv_f1 > best_cv_f1:
+                        best_cv_f1    = cv_f1
                         best_cw_label = cw_label
 
-            rf  = best_rf
-            ypr = rf.predict(Xte)
+                # نبني الموديل النهائي بأفضل class_weight
+                rf = RandomForestClassifier(
+                    n_estimators=100, random_state=42,
+                    class_weight='balanced' if best_cw_label == 'balanced' else None)
+                rf.fit(Xtr, ytr)
+                ypr = rf.predict(Xte)
+
+                # LR baseline للمقارنة
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.pipeline import make_pipeline
+                lr_pipe = make_pipeline(
+                    StandardScaler(),
+                    LogisticRegression(max_iter=1000, random_state=42,
+                                       class_weight='balanced', multi_class='auto'))
+                lr_pipe.fit(Xtr, ytr)
+                ypr_lr   = lr_pipe.predict(Xte)
+                f1_lr    = f1_score(ypr_lr, yte, average='weighted', zero_division=0)
+                acc_lr   = accuracy_score(yte, ypr_lr)
 
             acc  = accuracy_score(yte, ypr)
             prec = precision_score(yte, ypr, average='weighted', zero_division=0)
@@ -342,7 +365,13 @@ with tab1:
 
             # ── SHAP على Test Set كـ DataFrame ──
             with st.spinner("Computing SHAP values (sampled for speed)..."):
-                shap_v = compute_shap(rf, Xte, course_cols)
+                shap_result = compute_shap(rf, Xte, course_cols)
+                if isinstance(shap_result, tuple):
+                    shap_v, shap_sign = shap_result
+                    if isinstance(shap_v, str):   # error string
+                        shap_v, shap_sign = None, None
+                else:
+                    shap_v, shap_sign = None, None
 
             # ── FIX 1: StandardScaler fit on Train only → transform all ──
             with st.spinner("Running KMeans Clustering..."):
@@ -464,7 +493,7 @@ with tab1:
             st.markdown("#### 🤖 Random Forest Results")
             st.caption(
                 f"Train: {len(Xtr)} students (80%) · Test: {len(Xte)} students (20%) · "
-                f"5-fold CV on train · class_weight={best_cw_label} (auto-selected by F1)")
+                f"class_weight={best_cw_label} (chosen by 5-fold CV F1 on train — no test leakage)")
 
             m_cols = st.columns(6)
             for col, (l, v) in zip(m_cols, [
@@ -476,6 +505,24 @@ with tab1:
                 ("AUC-ROC",   f"{auc*100:.1f}%" if auc else "N/A"),
             ]):
                 metric_card(col, l, v)
+
+            # LR baseline comparison
+            with st.expander("📊 Model Comparison — RF vs Logistic Regression baseline"):
+                comp_data = {
+                    'Model': ['Random Forest (proposed)', 'Logistic Regression (baseline)'],
+                    'Accuracy': [f"{acc*100:.1f}%", f"{acc_lr*100:.1f}%"],
+                    'F1-Score': [f"{f1*100:.1f}%", f"{f1_lr*100:.1f}%"],
+                    'Advantage': [
+                        'Feature importance + SHAP explainability',
+                        'Simple, interpretable, fast baseline'
+                    ]
+                }
+                st.table(pd.DataFrame(comp_data))
+                delta = (f1 - f1_lr) * 100
+                if delta > 0:
+                    st.success(f"✅ RF outperforms LR baseline by {delta:.1f}% F1 — justifies complexity.")
+                else:
+                    st.warning(f"⚠️ LR baseline matches or beats RF by {abs(delta):.1f}% F1 — consider simpler model.")
 
             # Confusion Matrix
             st.markdown("**Confusion Matrix (test set)**")
@@ -504,21 +551,34 @@ with tab1:
                          color=['#3b82f6' if v > imps.mean() else '#334155' for v in ti.values],
                          height=.6)
                 ax4.axvline(imps.mean(), color='#d97706', linestyle='--', lw=1)
+                ax4.set_title('How often each course splits the trees', color='#94a3b8', fontsize=8)
                 plt.tight_layout(); st.pyplot(fig4); plt.close()
 
             with sh_c:
-                st.markdown("**SHAP Values — mean |SHAP|**")
-                if shap_v is not None and not isinstance(shap_v, str):
-                    ts = shap_v.sort_values(ascending=True)
+                st.markdown("**SHAP Values — magnitude + direction**")
+                if shap_v is not None:
+                    ts   = shap_v.sort_values(ascending=True)
+                    # لون حسب الـ direction: أخضر = موجب (يرفع Excellent)، أحمر = سالب
+                    colors_shap = []
+                    for feat in ts.index:
+                        direction = shap_sign.get(feat, 0) if shap_sign is not None else 0
+                        colors_shap.append('#16a34a' if direction >= 0 else '#dc2626')
                     fig5, ax5 = dark_fig((7, max(4, len(course_cols)*.4)))
-                    ax5.barh(ts.index, ts.values,
-                             color=['#7c3aed' if v > shap_v.mean() else '#334155' for v in ts.values],
-                             height=.6)
+                    ax5.barh(ts.index, ts.values, color=colors_shap, height=.6)
                     ax5.axvline(shap_v.mean(), color='#d97706', linestyle='--', lw=1)
-                    ax5.set_title('SHAP (sampled on test set)', color='#94a3b8', fontsize=8)
+                    ax5.set_title('mean|SHAP|  🟢=helps Excellent  🔴=hurts Excellent',
+                                  color='#94a3b8', fontsize=8)
                     plt.tight_layout(); st.pyplot(fig5); plt.close()
-                elif isinstance(shap_v, str):
-                    st.warning(f"SHAP error: {shap_v}")
+
+                    # جدول صغير يظهر الـ direction بوضوح
+                    shap_tbl = pd.DataFrame({
+                        'Course': shap_v.index[:8],
+                        'SHAP |value|': shap_v.values[:8].round(4),
+                        'Direction': ['🟢 → Excellent' if (shap_sign.get(c,0) if shap_sign is not None else 0) >= 0
+                                      else '🔴 → Weak/Avg'
+                                      for c in shap_v.index[:8]]
+                    })
+                    st.dataframe(shap_tbl, hide_index=True, use_container_width=True)
                 else:
                     st.info("SHAP not available.")
 
@@ -533,15 +593,16 @@ with tab1:
 | CV Acc.   | {cv*100:.1f}%   | 5-fold mean | Stability — close to Accuracy = no overfit |
 | AUC-ROC   | {f"{auc*100:.1f}%" if auc else "N/A"} | Area under ROC | Threshold-independent quality |
 
-**class_weight selected:** `{best_cw_label}` — auto-chosen by weighted F1 on test set.
+**class_weight selected:** `{best_cw_label}` — chosen by 5-fold CV weighted F1 on training set only.
+No test data was used in this selection → no model-selection leakage.
 
-**SHAP vs Feature Importance:**
-- Feature Importance = average Gini decrease across 100 trees (global)
-- SHAP = exact contribution per feature per prediction (local, more precise)
-- If they disagree on a course → that course has non-linear behaviour worth investigating
+**SHAP direction guide:**
+- 🟢 Green bar = higher grade in this course → pushes prediction toward Excellent
+- 🔴 Red bar   = higher grade in this course → pushes prediction toward Weak/Average
+- Divergence between SHAP magnitude and RF importance → non-linear course behaviour
 
-**StandardScaler:** fitted on training rows only, then applied to all students for clustering.
-This prevents any statistical leakage from test-set rows into the clustering scale.
+**LR Baseline:** Logistic Regression provides a simple linear reference.
+RF advantage over LR = {(f1-f1_lr)*100:.1f}% F1.
                 """)
 
             # ════════════════════
@@ -610,7 +671,8 @@ This prevents any statistical leakage from test-set rows into the clustering sca
             # ══ حفظ كل النتائج في session_state ══
             # هذا يحل مشكلة ضياع النتائج عند الضغط على Generate Report
             # نحفظ shap_v فقط إذا كانت Series حقيقية
-            shap_to_save = shap_v if (shap_v is not None and isinstance(shap_v, pd.Series)) else None
+            shap_to_save      = shap_v    if (shap_v    is not None and isinstance(shap_v,    pd.Series)) else None
+            shap_sign_to_save = shap_sign if (shap_sign is not None and isinstance(shap_sign, pd.Series)) else None
             st.session_state['s1'] = {
                 'df': df, 'avgs': avgs, 'fr': fr,
                 'wc': wc, 'mc': mc, 'gc': gc,
@@ -619,10 +681,12 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                 'Xtr': Xtr, 'Xte': Xte, 'ytr': ytr, 'yte': yte, 'ypr': ypr,
                 'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1,
                 'cv': cv, 'auc': auc, 'imps': imps,
-                'shap_v': shap_to_save, 'best_cw_label': best_cw_label,
+                'shap_v': shap_to_save, 'shap_sign': shap_sign_to_save,
+                'best_cw_label': best_cw_label,
                 'best_k': best_k, 'best_sil': max(silhs),
                 'lmap': lmap, 'ks': list(ks),
                 'inert': inert, 'silhs': silhs,
+                'f1_lr': f1_lr, 'acc_lr': acc_lr,
             }
             st.success("✅ Analysis complete — scroll down to generate the AI report.")
 
@@ -646,7 +710,7 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                 if st.button("📋 Generate Student Performance Report", key="b1_report"):
                     # نقرأ من session_state — لا نعيد التدريب
                     wc   = s['wc'];  mc   = s['mc'];  fr   = s['fr']
-                    imps = s['imps']; shap_v = s['shap_v']
+                    imps = s['imps']; shap_v = s['shap_v']; shap_sign = s.get('shap_sign')
                     acc  = s['acc']; prec = s['prec']; rec = s['rec']
                     f1   = s['f1'];  cv   = s['cv'];  auc = s['auc']
                     cnts = s['cnts']; df  = s['df']
@@ -656,6 +720,7 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                     best_cw_label = s['best_cw_label']
                     best_k = s['best_k']; best_sil = s['best_sil']
                     lmap = s['lmap']
+                    f1_lr = s.get('f1_lr', 0)
 
                     with st.spinner("Generating AI report..."):
 
@@ -813,9 +878,11 @@ with tab2:
                 for cat, skills in tax.items():
                     for s in skills:
                         sc   = clean_text(s)
-                        freq = atxt.count(sc)
+                        # word boundary matching — يمنع "sql" من match داخل "nosql"
+                        pattern = r'\b' + re.escape(sc) + r'\b'
+                        freq = len(re.findall(pattern, atxt))
                         ts   = tsum.get(sc, 0.0)
-                        jw   = sum(1 for t in clean if sc in t)
+                        jw   = sum(1 for t in clean if re.search(pattern, t))
                         cov  = jw / len(clean) * 100
                         if freq > 0:
                             skill_r[s] = {
@@ -844,7 +911,7 @@ with tab2:
                         for s, d in skill_r.items():
                             se  = bert_model.encode([s], convert_to_numpy=True)
                             sim = cosine_similarity(se, job_emb)[0]
-                            m   = (sim >= 0.45).sum()
+                            m   = (sim >= bert_threshold).sum()
                             d['bert_sim'] = round(float(sim.mean()), 4)
                             d['bert_cov'] = round(m / len(sample) * 100, 1)
                     bert_status = f"✅ {bert_name}"
