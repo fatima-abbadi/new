@@ -130,28 +130,35 @@ def compute_auc(model, X_te, y_te, classes):
 def compute_shap(model, X_te_df, features):
     """
     يرجع (mean_abs_shap, mean_signed_shap):
-    - mean_abs  → حجم التأثير  (للرسمة الرئيسية)
-    - mean_sign → اتجاه التأثير (موجب = يرفع النجاح، سالب = يخفضه)
+    - mean_abs  → حجم التأثير (للرسمة الرئيسية)
+    - mean_sign → اتجاه التأثير بالنسبة لكلاس 'Excellent'
+                  موجب = يرفع احتمال Excellent، سالب = يخفضه
+    نستخدم model.classes_ للعثور على index الكلاس الصحيح
+    بدل افتراض آخر عنصر في القائمة.
     """
     try:
         arr = np.array(X_te_df.values[:min(50, len(X_te_df))], dtype=float)
         exp = shap.TreeExplainer(model)
         sv  = exp.shap_values(arr)
+
+        # نحدد index كلاس Excellent بدقة
+        classes = list(model.classes_)
+        exc_idx = classes.index('Excellent') if 'Excellent' in classes else len(classes)-1
+
         if isinstance(sv, list):
-            # multi-class: list of (n_samples, n_features) per class
-            # نأخذ آخر كلاس (Excellent/highest) لحساب الـ direction
-            stacked  = np.stack([np.abs(s) for s in sv], axis=0)
-            mean_abs = stacked.mean(axis=0).mean(axis=0)          # (n_features,)
-            # direction: SHAP للكلاس الأعلى (Excellent)
-            last_cls = sv[-1]                                      # (n_samples, n_features)
-            mean_sign = last_cls.mean(axis=0)                      # (n_features,)
+            # list of (n_samples, n_features) — واحد لكل كلاس
+            stacked  = np.stack([np.abs(s) for s in sv], axis=0)  # (n_classes, n, f)
+            mean_abs = stacked.mean(axis=0).mean(axis=0)            # (n_features,)
+            mean_sign = sv[exc_idx].mean(axis=0)                    # (n_features,) للـ Excellent
         elif sv.ndim == 3:
             # (n_samples, n_features, n_classes)
-            mean_abs  = np.abs(sv).mean(axis=0).mean(axis=1)      # (n_features,)
-            mean_sign = sv[:, :, -1].mean(axis=0)                  # direction لآخر كلاس
+            mean_abs  = np.abs(sv).mean(axis=0).mean(axis=1)        # (n_features,)
+            mean_sign = sv[:, :, exc_idx].mean(axis=0)              # (n_features,)
         else:
+            # binary
             mean_abs  = np.abs(sv).mean(axis=0)
             mean_sign = sv.mean(axis=0)
+
         abs_s  = pd.Series(mean_abs,  index=features).sort_values(ascending=False)
         sign_s = pd.Series(mean_sign, index=features)
         return abs_s, sign_s
@@ -280,9 +287,23 @@ with tab1:
                 options=num_cols,
                 index=num_cols.index('Final_Grade') if 'Final_Grade' in num_cols else len(num_cols)-1)
 
-        t1, t2 = st.columns(2)
-        with t1: wt = st.slider("Weak: score below", 30, 70, 60)
-        with t2: at = st.slider("Average: score below", 65, 90, 75)
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            thresh_mode = st.radio("Threshold mode:",
+                ["Fixed score", "Quantile (data-driven)"], index=0,
+                help="Fixed: you set the cutoffs. Quantile: bottom/top X% of students.")
+        with t2:
+            if thresh_mode == "Fixed score":
+                wt = st.slider("Weak: score below", 30, 70, 60)
+            else:
+                wq = st.slider("Weak: bottom %", 5, 40, 25)
+                wt = None  # سيُحسب بعد التقسيم
+        with t3:
+            if thresh_mode == "Fixed score":
+                at = st.slider("Average: score below", 65, 90, 75)
+            else:
+                aq = st.slider("Excellent: top %", 10, 40, 25)
+                at = None  # سيُحسب بعد التقسيم
 
         if st.button("🔍 Run Analysis", key="b1_run"):
             if len(course_cols) < 2:
@@ -294,65 +315,86 @@ with tab1:
 
             df = df_raw.copy()
 
-            # ── Descriptive stats (all data) ──
+            # ── Train / Test split أولاً ──
+            X     = df[course_cols]
+            y_raw = df[final_col]
+            Xtr, Xte, ytr_r, yte_r = train_test_split(
+                X, y_raw, test_size=0.2, random_state=42)
+
+            # ── Thresholds: إما fixed أو quantile من Train فقط ──
+            if thresh_mode == "Quantile (data-driven)":
+                wt = float(np.percentile(ytr_r, wq))
+                at = float(np.percentile(ytr_r, 100 - aq))
+                st.info(f"📊 Quantile thresholds (from training set): "
+                        f"Weak < {wt:.1f} | Excellent ≥ {at:.1f}")
+            # wt و at محددتين يدوياً إذا Fixed
+
+            # classify uses thresholds computed/set before training
+            def classify(g):
+                if g < wt:   return 'Weak'
+                elif g < at: return 'Average'
+                return 'Excellent'
+
+            # ── Descriptive stats — نسخة display منفصلة عن التدريب ──
+            st.caption("ℹ️ Descriptive stats computed on full dataset — display only, not used in training.")
+            df_display = df.copy()
+            df_display['Level'] = df_display[final_col].apply(classify)
+            cnts = df_display['Level'].value_counts()
             avgs = df[course_cols].mean().sort_values()
             fr   = {c: (df[c] < wt).mean()*100 for c in course_cols}
             wc   = avgs[avgs < wt]
             mc   = avgs[(avgs >= wt) & (avgs < at)]
             gc   = avgs[avgs >= at]
 
-            # classify uses fixed thresholds — safe to apply before or after split
-            def classify(g):
-                if g < wt:   return 'Weak'
-                elif g < at: return 'Average'
-                return 'Excellent'
-
-            df['Level'] = df[final_col].apply(classify)
-            cnts = df['Level'].value_counts()
-
-            # ── Train / Test split ──
-            X     = df[course_cols]
-            y_raw = df[final_col]
-            Xtr, Xte, ytr_r, yte_r = train_test_split(
-                X, y_raw, test_size=0.2, random_state=42)
-
-            # Labels applied AFTER split (best practice — avoids any future leakage
-            # if thresholds ever become data-dependent)
+            # Labels applied AFTER split — لا يُستخدم df_display في التدريب
             ytr = ytr_r.apply(classify)
             yte = yte_r.apply(classify)
 
-            # ── class_weight: اختيار بـ CV على Train فقط (بدون لمس Test) ──
-            with st.spinner("Training models (RF + LR baseline)..."):
+            # ── RF: RandomizedSearchCV على Train فقط ──
+            with st.spinner("Training models — RF tuning + LR baseline..."):
+                from sklearn.linear_model    import LogisticRegression
+                from sklearn.pipeline        import make_pipeline
+                from sklearn.model_selection import RandomizedSearchCV
+
+                # اختيار class_weight بـ CV على Train (بدون لمس Test)
                 best_cw_label = 'balanced'
                 best_cv_f1    = -1
                 for cw, cw_label in [('balanced', 'balanced'), (None, 'none')]:
-                    rf_tmp  = RandomForestClassifier(
+                    rf_tmp = RandomForestClassifier(
                         n_estimators=100, random_state=42, class_weight=cw)
                     cv_f1 = cross_val_score(
-                        rf_tmp, Xtr, ytr, cv=5,
-                        scoring='f1_weighted').mean()
+                        rf_tmp, Xtr, ytr, cv=5, scoring='f1_weighted').mean()
                     if cv_f1 > best_cv_f1:
                         best_cv_f1    = cv_f1
                         best_cw_label = cw_label
 
-                # نبني الموديل النهائي بأفضل class_weight
-                rf = RandomForestClassifier(
-                    n_estimators=100, random_state=42,
+                # RandomizedSearchCV للـ hyperparameter tuning — على Train فقط
+                param_dist = {
+                    'n_estimators':      [100, 200],
+                    'max_depth':         [None, 5, 10, 15],
+                    'min_samples_split': [2, 5, 10],
+                    'min_samples_leaf':  [1, 2, 4],
+                }
+                rf_base = RandomForestClassifier(
+                    random_state=42,
                     class_weight='balanced' if best_cw_label == 'balanced' else None)
-                rf.fit(Xtr, ytr)
+                rscv = RandomizedSearchCV(
+                    rf_base, param_dist, n_iter=12, cv=3,
+                    scoring='f1_weighted', random_state=42, n_jobs=-1)
+                rscv.fit(Xtr, ytr)
+                rf  = rscv.best_estimator_
                 ypr = rf.predict(Xte)
+                best_params = rscv.best_params_
 
-                # LR baseline للمقارنة
-                from sklearn.linear_model import LogisticRegression
-                from sklearn.pipeline import make_pipeline
+                # LR baseline
                 lr_pipe = make_pipeline(
                     StandardScaler(),
                     LogisticRegression(max_iter=1000, random_state=42,
                                        class_weight='balanced'))
                 lr_pipe.fit(Xtr, ytr)
-                ypr_lr   = lr_pipe.predict(Xte)
-                f1_lr    = f1_score(ypr_lr, yte, average='weighted', zero_division=0)
-                acc_lr   = accuracy_score(yte, ypr_lr)
+                ypr_lr  = lr_pipe.predict(Xte)
+                f1_lr   = f1_score(ypr_lr,  yte, average='weighted', zero_division=0)
+                acc_lr  = accuracy_score(yte, ypr_lr)
 
             acc  = accuracy_score(yte, ypr)
             prec = precision_score(yte, ypr, average='weighted', zero_division=0)
@@ -363,37 +405,71 @@ with tab1:
             cls  = sorted(ytr.unique())
             auc  = compute_auc(rf, Xte.values, yte, cls)
 
-            # ── SHAP على Test Set كـ DataFrame ──
-            with st.spinner("Computing SHAP values (sampled for speed)..."):
+            # Early Warning: predict_proba للـ risk score
+            yproba = rf.predict_proba(Xte)
+            cls_list = list(rf.classes_)
+            weak_idx = cls_list.index('Weak') if 'Weak' in cls_list else 0
+            risk_scores = yproba[:, weak_idx]  # احتمال الضعف لكل طالب في Test
+
+            # ── SHAP ──
+            with st.spinner("Computing SHAP values..."):
                 shap_result = compute_shap(rf, Xte, course_cols)
                 if isinstance(shap_result, tuple):
                     shap_v, shap_sign = shap_result
-                    if isinstance(shap_v, str):   # error string
+                    if isinstance(shap_v, str):
                         shap_v, shap_sign = None, None
                 else:
                     shap_v, shap_sign = None, None
 
-            # ── FIX 1: StandardScaler fit on Train only → transform all ──
+            # ── Fix 3: SHAP positive_ratio ──
+            shap_pos_ratio = None
+            if shap_v is not None:
+                try:
+                    arr = np.array(Xte.values[:min(50, len(Xte))], dtype=float)
+                    exp = shap.TreeExplainer(rf)
+                    sv  = exp.shap_values(arr)
+                    exc_idx = cls_list.index('Excellent') if 'Excellent' in cls_list else -1
+                    if isinstance(sv, list):
+                        sv_exc = sv[exc_idx]
+                    elif sv.ndim == 3:
+                        sv_exc = sv[:, :, exc_idx]
+                    else:
+                        sv_exc = sv
+                    # نسبة الطلاب حيث هذه المادة تساعد على Excellent
+                    pos_ratio = (sv_exc > 0).mean(axis=0)
+                    shap_pos_ratio = pd.Series(pos_ratio, index=course_cols)
+                except Exception:
+                    shap_pos_ratio = None
+
+            # ── Fix 2: KMeans على Train فقط ثم assign للباقي ──
             with st.spinner("Running KMeans Clustering..."):
-                X_for_scale = df[course_cols].fillna(df[course_cols].mean())
+                X_all   = df[course_cols].fillna(df[course_cols].mean())
+                X_tr_cl = X_all.iloc[Xtr.index]
+                X_te_cl = X_all.iloc[Xte.index]
+
                 scaler = StandardScaler()
-                # fit ONLY on training rows to avoid data leakage
-                scaler.fit(X_for_scale.iloc[Xtr.index])
-                Xs = scaler.transform(X_for_scale)   # transform on all 415
+                scaler.fit(X_tr_cl)
+                Xs_tr = scaler.transform(X_tr_cl)
+                Xs_te = scaler.transform(X_te_cl)
+                Xs_all = scaler.transform(X_all)   # للرسم فقط
 
                 ks = range(2, max_k + 1)
                 inert, silhs = [], []
                 for k in ks:
                     km_tmp = KMeans(n_clusters=k, random_state=42, n_init=10)
-                    lb     = km_tmp.fit_predict(Xs)
+                    lb     = km_tmp.fit_predict(Xs_tr)   # fit على Train فقط
                     inert.append(km_tmp.inertia_)
-                    silhs.append(silhouette_score(Xs, lb))
+                    silhs.append(silhouette_score(Xs_tr, lb))
 
                 best_k = list(ks)[np.argmax(silhs)]
                 km_f   = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-                df['Cluster'] = km_f.fit_predict(Xs)
+                km_f.fit(Xs_tr)                           # تدريب على Train
+                # assign للكل بعد التدريب
+                df.loc[Xtr.index, 'Cluster'] = km_f.predict(Xs_tr)
+                df.loc[Xte.index, 'Cluster'] = km_f.predict(Xs_te)
+                df['Cluster'] = df['Cluster'].astype(int)
 
-                pca_c    = PCA(n_components=2).fit_transform(Xs)
+                pca_c    = PCA(n_components=2).fit_transform(Xs_all)
                 df['P1'] = pca_c[:, 0]
                 df['P2'] = pca_c[:, 1]
 
@@ -555,30 +631,30 @@ with tab1:
                 plt.tight_layout(); st.pyplot(fig4); plt.close()
 
             with sh_c:
-                st.markdown("**SHAP Values — magnitude + direction**")
+                st.markdown("**SHAP — magnitude + direction + % cases**")
                 if shap_v is not None:
-                    ts   = shap_v.sort_values(ascending=True)
-                    # لون حسب الـ direction: أخضر = موجب (يرفع Excellent)، أحمر = سالب
+                    ts = shap_v.sort_values(ascending=True)
                     colors_shap = []
                     for feat in ts.index:
-                        direction = shap_sign.get(feat, 0) if shap_sign is not None else 0
-                        colors_shap.append('#16a34a' if direction >= 0 else '#dc2626')
+                        d_val = shap_sign.get(feat, 0) if shap_sign is not None else 0
+                        colors_shap.append('#16a34a' if d_val >= 0 else '#dc2626')
                     fig5, ax5 = dark_fig((7, max(4, len(course_cols)*.4)))
                     ax5.barh(ts.index, ts.values, color=colors_shap, height=.6)
                     ax5.axvline(shap_v.mean(), color='#d97706', linestyle='--', lw=1)
-                    ax5.set_title('mean|SHAP|  🟢=helps Excellent  🔴=hurts Excellent',
+                    ax5.set_title('mean|SHAP|  🟢=helps Excellent  🔴=hurts',
                                   color='#94a3b8', fontsize=8)
                     plt.tight_layout(); st.pyplot(fig5); plt.close()
-
-                    # جدول صغير يظهر الـ direction بوضوح
-                    shap_tbl = pd.DataFrame({
-                        'Course': shap_v.index[:8],
-                        'SHAP |value|': shap_v.values[:8].round(4),
-                        'Direction': ['🟢 → Excellent' if (shap_sign.get(c,0) if shap_sign is not None else 0) >= 0
-                                      else '🔴 → Weak/Avg'
-                                      for c in shap_v.index[:8]]
-                    })
-                    st.dataframe(shap_tbl, hide_index=True, use_container_width=True)
+                    rows_shap = []
+                    for c in shap_v.index[:10]:
+                        d_val = shap_sign.get(c, 0) if shap_sign is not None else 0
+                        pr    = shap_pos_ratio.get(c, float('nan')) if shap_pos_ratio is not None else float('nan')
+                        rows_shap.append({
+                            'Course': c,
+                            '|SHAP|': round(float(shap_v[c]), 4),
+                            'Direction': '🟢 Excellent' if d_val >= 0 else '🔴 Weak/Avg',
+                            '% helps': f"{pr*100:.0f}%" if not np.isnan(pr) else '—'
+                        })
+                    st.dataframe(pd.DataFrame(rows_shap), hide_index=True, use_container_width=True)
                 else:
                     st.info("SHAP not available.")
 
@@ -593,17 +669,41 @@ with tab1:
 | CV Acc.   | {cv*100:.1f}%   | 5-fold mean | Stability — close to Accuracy = no overfit |
 | AUC-ROC   | {f"{auc*100:.1f}%" if auc else "N/A"} | Area under ROC | Threshold-independent quality |
 
-**class_weight selected:** `{best_cw_label}` — chosen by 5-fold CV weighted F1 on training set only.
-No test data was used in this selection → no model-selection leakage.
+**Best RF hyperparameters (RandomizedSearchCV, 3-fold CV on train):**
+`{best_params}`
+
+**class_weight selected:** `{best_cw_label}` — 5-fold CV F1 on train only. No test leakage.
 
 **SHAP direction guide:**
-- 🟢 Green bar = higher grade in this course → pushes prediction toward Excellent
-- 🔴 Red bar   = higher grade in this course → pushes prediction toward Weak/Average
-- Divergence between SHAP magnitude and RF importance → non-linear course behaviour
+- 🟢 Green = higher grade → pushes toward Excellent
+- 🔴 Red   = higher grade → pushes toward Weak/Average
+- % column = % of test students where this course helped Excellent
 
-**LR Baseline:** Logistic Regression provides a simple linear reference.
-RF advantage over LR = {(f1-f1_lr)*100:.1f}% F1.
+**Clustering:** KMeans fitted on training rows only. Test rows assigned via predict().
+This prevents any test-set information from influencing cluster centres.
+
+**LR Baseline:** RF advantage = {(f1-f1_lr)*100:.1f}% F1.
                 """)
+
+
+            # ── Early Warning: Risk Scores ──
+            st.markdown("---")
+            st.markdown("#### 🚨 Early Warning — Student Risk Scores (Test Set)")
+            st.caption("Risk = predicted probability of being classified as 'Weak'. "
+                       "Based on model trained on 80% of data.")
+            risk_df = pd.DataFrame({
+                'Student#': range(1, len(Xte)+1),
+                'Risk %':   (risk_scores * 100).round(1),
+                'Actual':   yte.values,
+                'Predicted': ypr,
+            }).sort_values('Risk %', ascending=False)
+            high_risk = risk_df[risk_df['Risk %'] >= 50]
+            r1, r2, r3 = st.columns(3)
+            r1.metric("High Risk (≥50%)", len(high_risk), delta_color="inverse")
+            r2.metric("Avg Risk Score",   f"{risk_scores.mean()*100:.1f}%")
+            r3.metric("Max Risk Score",   f"{risk_scores.max()*100:.1f}%")
+            with st.expander(f"📋 Top {min(20, len(risk_df))} Highest-Risk Students"):
+                st.dataframe(risk_df.head(20), hide_index=True, use_container_width=True)
 
             # ════════════════════
             # CLUSTERING
@@ -751,9 +851,13 @@ RF advantage over LR = {(f1-f1_lr)*100:.1f}% F1.
                         prompt = f"""You are a senior academic consultant writing a formal institutional report
 for the Head of a Computer Science Department.
 
-IMPORTANT: You are a report-generation tool. All quantitative values below come from
-computed data — use them accurately. Do not invent numbers. Present findings as
-evidence-based suggestions, not absolute decisions.
+IMPORTANT RULES:
+1. Use ONLY the quantitative values provided below — do not invent numbers.
+2. For textbooks, recommend ONLY widely known CS textbooks (e.g., Tanenbaum, CLRS, Silberschatz,
+   Sommerville, Kurose & Ross, Russell & Norvig, Goodfellow et al.). Do NOT invent book titles.
+3. For YouTube channels, recommend ONLY real, well-known channels (e.g., MIT OpenCourseWare,
+   freeCodeCamp, Neso Academy, CS50, 3Blue1Brown). Do NOT invent channel names.
+4. Present findings as evidence-based suggestions — not absolute decisions.
 
 === STUDENT DATA ({len(df)} students) ===
 Random Forest: Train={len(Xtr)} | Test={len(Xte)} | class_weight={best_cw_label}
@@ -869,7 +973,9 @@ with tab2:
                 clean = [preprocess(t) for t in raw]
                 atxt  = ' '.join(clean)
 
-                vec   = TfidfVectorizer(ngram_range=(1,3), min_df=2, max_df=0.95, sublinear_tf=True)
+                vec   = TfidfVectorizer(ngram_range=(1,3), min_df=1, max_df=0.95, sublinear_tf=True)
+                # min_df=1: نبقي المهارات النادرة من الـ taxonomy (Rust, LLM, etc.)
+                # TF-IDF يعطيهم score منخفض تلقائياً إذا كانوا نادرين جداً
                 tmat  = vec.fit_transform(clean)
                 fname = vec.get_feature_names_out()
                 tsum  = dict(zip(fname, np.asarray(tmat.sum(axis=0)).flatten()))
@@ -905,15 +1011,21 @@ with tab2:
                 if bert_model:
                     with st.spinner("Computing BERT semantic similarity..."):
                         sample  = clean[:min(300, len(clean))]
-                        job_emb = bert_model.encode(
-                            sample, batch_size=32,
-                            show_progress_bar=False, convert_to_numpy=True)
+                        # Cache job embeddings — لا نعيد الحساب لكل مهارة
+                        @st.cache_data(show_spinner=False)
+                        def get_job_embeddings(_model, texts):
+                            return _model.encode(texts, batch_size=32,
+                                                 show_progress_bar=False,
+                                                 convert_to_numpy=True)
+                        job_emb = get_job_embeddings(bert_model, tuple(sample))
                         for s, d in skill_r.items():
                             se  = bert_model.encode([s], convert_to_numpy=True)
                             sim = cosine_similarity(se, job_emb)[0]
                             m   = (sim >= bert_threshold).sum()
-                            d['bert_sim'] = round(float(sim.mean()), 4)
-                            d['bert_cov'] = round(m / len(sample) * 100, 1)
+                            # max similarity أقوى signal من mean
+                            d['bert_sim']     = round(float(sim.mean()), 4)
+                            d['bert_sim_max']  = round(float(sim.max()),  4)
+                            d['bert_cov']     = round(m / len(sample) * 100, 1)
                     bert_status = f"✅ {bert_name}"
                 else:
                     bert_status = "⚠️ sentence-transformers not installed"
@@ -1028,23 +1140,46 @@ Combined → most complete skill demand signal.
                 st.markdown("---")
                 st.markdown("#### Gap Analysis — Curriculum vs Market")
                 curr_courses = [c.strip() for c in curr_in.split(',') if c.strip()]
+
+                # إذا BERT متاح — نستخدمه للمقارنة الدلالية
+                use_bert_gap = has_bert and bert_model is not None
+                if use_bert_gap:
+                    curr_embs = bert_model.encode(curr_courses, convert_to_numpy=True)
+
                 gap_rows = []
                 for s, d in top30[:20]:
-                    covered = any(
+                    # طريقة 1: string matching (دائماً)
+                    string_match = any(
                         s.lower() in c.lower() or c.lower() in s.lower()
                         for c in curr_courses)
+                    # طريقة 2: BERT semantic match (إذا متاح)
+                    if use_bert_gap:
+                        se  = bert_model.encode([s], convert_to_numpy=True)
+                        sim = cosine_similarity(se, curr_embs)[0]
+                        bert_match = float(sim.max()) >= bert_threshold
+                        covered = string_match or bert_match
+                        match_type = ('✅ String' if string_match else
+                                      f'🔵 BERT ({sim.max():.2f})' if bert_match else '❌ Gap')
+                    else:
+                        covered    = string_match
+                        match_type = '✅ Yes' if string_match else '❌ Gap'
+
                     gap_rows.append({
                         'Skill': s, 'Category': d['category'],
                         'TF-IDF': d['tfidf_score'],
                         'Coverage %': d['job_coverage'],
-                        'In Curriculum': '✅ Yes' if covered else '❌ Gap'
+                        'In Curriculum': match_type
                     })
+
                 gdf = pd.DataFrame(gap_rows)
                 st.dataframe(gdf, use_container_width=True, hide_index=True)
                 n_gaps = sum(1 for r in gap_rows if '❌' in r['In Curriculum'])
                 g1, g2 = st.columns(2)
-                g1.metric("Skills with Gap", n_gaps,            delta_color="inverse")
+                g1.metric("Skills with Gap", n_gaps,             delta_color="inverse")
                 g2.metric("Skills Covered",  len(gap_rows)-n_gaps)
+                if use_bert_gap:
+                    st.caption("🔵 BERT semantic matching active — "
+                               "'machine learning' can match 'ML' or 'AI Engineering'")
 
             # ══ حفظ نتائج Tab 2 في session_state ══
             st.session_state['s2'] = {
@@ -1104,8 +1239,11 @@ Combined → most complete skill demand signal.
                         prompt_j = f"""You are a senior academic consultant writing a formal curriculum analysis
 report for the Head of a Computer Science Department.
 
-IMPORTANT: You are a report-generation tool. Use the numbers below accurately.
-Do not invent data. Present as evidence-based suggestions for expert review.
+IMPORTANT RULES:
+1. Use the numbers below accurately — do not invent data.
+2. For textbooks: ONLY widely known CS books (Tanenbaum, CLRS, Silberschatz, etc.).
+3. For YouTube: ONLY real channels (MIT OCW, freeCodeCamp, CS50, Neso Academy, etc.).
+4. Present as evidence-based suggestions for expert review.
 
 === JOB MARKET DATA ({s2['jobs_n']} listings — TF-IDF + BERT NLP) ===
 TOP 20 IN-DEMAND SKILLS:
