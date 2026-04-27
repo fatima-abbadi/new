@@ -124,17 +124,16 @@ def compute_auc(model, X_te, y_te, classes):
     except Exception:
         return None
 
-# ── FIX 3: SHAP على عيّنة محدودة لتجنب البطء ──
-def compute_shap(model, X_tr, X_te, features):
+# ── FIX 3: SHAP على عيّنة محدودة — يستقبل DataFrame مباشرة ──
+def compute_shap(model, X_te_df, features):
     """
     SHAP على max 50 عيّنة من Test Set.
-    يمنع التوقف على Streamlit Cloud.
+    يستقبل DataFrame للحفاظ على أسماء الأعمدة.
     """
     try:
-        sample_size = min(50, len(X_te))
-        X_sample = X_te[:sample_size]
+        sample = X_te_df.iloc[:min(50, len(X_te_df))]
         exp = shap.TreeExplainer(model)
-        sv  = exp.shap_values(X_sample)
+        sv  = exp.shap_values(sample)
         ma  = np.mean([np.abs(s) for s in sv], axis=0) if isinstance(sv, list) else np.abs(sv)
         return pd.Series(ma.mean(axis=0), index=features).sort_values(ascending=False)
     except Exception:
@@ -329,9 +328,9 @@ with tab1:
             cls  = sorted(ytr.unique())
             auc  = compute_auc(rf, Xte.values, yte, cls)
 
-            # ── SHAP on limited sample ──
+            # ── SHAP على Test Set كـ DataFrame ──
             with st.spinner("Computing SHAP values (sampled for speed)..."):
-                shap_v = compute_shap(rf, Xtr.values, Xte.values, course_cols)
+                shap_v = compute_shap(rf, Xte, course_cols)
 
             # ── FIX 1: StandardScaler fit on Train only → transform all ──
             with st.spinner("Running KMeans Clustering..."):
@@ -594,12 +593,30 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                 pd_prof.index = [lmap.get(i, f'C{i}') for i in pd_prof.index]
                 st.dataframe(pd_prof.round(1), use_container_width=True)
 
-            # ════════════════════
-            # AI REPORT
-            # ════════════════════
+            # ══ حفظ كل النتائج في session_state ══
+            # هذا يحل مشكلة ضياع النتائج عند الضغط على Generate Report
+            st.session_state['s1'] = {
+                'df': df, 'avgs': avgs, 'fr': fr,
+                'wc': wc, 'mc': mc, 'gc': gc,
+                'cnts': cnts, 'course_cols': course_cols,
+                'wt': wt, 'at': at,
+                'Xtr': Xtr, 'Xte': Xte, 'ytr': ytr, 'yte': yte, 'ypr': ypr,
+                'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1,
+                'cv': cv, 'auc': auc, 'imps': imps,
+                'shap_v': shap_v, 'best_cw_label': best_cw_label,
+                'best_k': best_k, 'best_sil': max(silhs),
+                'lmap': lmap, 'ks': list(ks),
+                'inert': inert, 'silhs': silhs,
+            }
+            st.success("✅ Analysis complete — scroll down to generate the AI report.")
+
+        # ════════════════════
+        # AI REPORT — خارج if button بحيث لا يختفي عند أي تفاعل
+        # ════════════════════
+        if 's1' in st.session_state:
+            s = st.session_state['s1']
             st.markdown("---")
             st.markdown("#### 🤖 AI Institutional Report")
-            # ── FIX 5: LLM disclaimer ──
             st.markdown(
                 '<div class="bb">The AI generates a <b>report based on the numbers above</b>. '
                 'All quantitative claims are grounded in computed data. '
@@ -611,6 +628,19 @@ This prevents any statistical leakage from test-set rows into the clustering sca
                 st.warning("⚠️ Add Groq API Key in the sidebar.")
             else:
                 if st.button("📋 Generate Student Performance Report", key="b1_report"):
+                    # نقرأ من session_state — لا نعيد التدريب
+                    wc   = s['wc'];  mc   = s['mc'];  fr   = s['fr']
+                    imps = s['imps']; shap_v = s['shap_v']
+                    acc  = s['acc']; prec = s['prec']; rec = s['rec']
+                    f1   = s['f1'];  cv   = s['cv'];  auc = s['auc']
+                    cnts = s['cnts']; df  = s['df']
+                    course_cols = s['course_cols']
+                    wt   = s['wt'];  at  = s['at']
+                    Xtr  = s['Xtr']; Xte = s['Xte']
+                    best_cw_label = s['best_cw_label']
+                    best_k = s['best_k']; best_sil = s['best_sil']
+                    lmap = s['lmap']
+
                     with st.spinner("Generating AI report..."):
 
                         def shap_val_str(c):
@@ -693,21 +723,24 @@ Numbered, most urgent first. Include measurable targets."""
 
                         result = call_groq(groq_key, prompt, max_tokens=3000)
                         st.markdown(result)
+                        st.session_state['s1_report'] = result
 
-                        report_txt = (
-                            f"CS DEPARTMENT — STUDENT PERFORMANCE REPORT\n{'='*60}\n\n"
-                            f"Students={len(df)} | RF F1={f1*100:.1f}% | "
-                            f"class_weight={best_cw_label} | Clusters={best_k}\n\n"
-                            f"WEAK COURSES:\n{weak_str}\n\n"
-                            f"CLUSTERS:\n{cluster_str}\n\n"
-                            f"{'='*60}\nAI REPORT\n{'='*60}\n\n{result}"
-                        )
-                        st.download_button(
-                            "📥 Download Student Report",
-                            data=report_txt,
-                            file_name="student_report.txt",
-                            mime="text/plain"
-                        )
+                if 's1_report' in st.session_state:
+                    result = st.session_state['s1_report']
+                    s2 = st.session_state['s1']
+                    report_txt = (
+                        f"CS DEPARTMENT — STUDENT PERFORMANCE REPORT\n{'='*60}\n\n"
+                        f"Students={len(s2['df'])} | RF F1={s2['f1']*100:.1f}% | "
+                        f"class_weight={s2['best_cw_label']} | Clusters={s2['best_k']}\n\n"
+                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n{result}"
+                    )
+                    st.download_button(
+                        "📥 Download Student Report",
+                        data=report_txt,
+                        file_name="student_report.txt",
+                        mime="text/plain",
+                        key="dl_s1"
+                    )
     else:
         st.info("📂 Upload any student grades CSV to begin.")
 
