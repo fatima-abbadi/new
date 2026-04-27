@@ -4,5 +4,6 @@ numpy
 matplotlib
 scikit-learn
 groq
-imbalanced-learn
 shap
+sentence-transformers
+ 
