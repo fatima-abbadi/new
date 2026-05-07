@@ -1,12 +1,13 @@
 """
-CS Department Intelligence System v5
+CS Department Intelligence System v6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-التحسينات عن v4:
-  1. StandardScaler: fit على Train فقط → transform على الكل (لا data leakage في clustering)
-  2. class_weight: نجرب balanced و None ونختار الأفضل F1 تلقائياً
-  3. SHAP: على عيّنة max(50) من Test لتجنب البطء
-  4. column detection: auto_c كاقتراح فقط، المستخدم يتحكم يدوياً
-  5. LLM disclaimer في الـ prompt والواجهة
+التحسينات عن v5:
+  1. Stratified Split — يحافظ على نسب Weak/Average/Excellent في Train وTest
+  2. Course Priority Score — يجمع fail_rate + SHAP + RF importance في score واحد
+  3. Cross-Branch Linking — ربط Branch A مع Branch B في الـ AI Report
+  4. SHAP positive_ratio محسّن — يستخدم model.classes_ للدقة
+  5. Early Warning محسّن — يعرض risk distribution chart
+  6. Validation Section — يثبت صحة الحسابات للورقة العلمية
 """
 
 import streamlit as st
@@ -17,10 +18,14 @@ import matplotlib.patches as mpatches
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (train_test_split, cross_val_score,
+                                      RandomizedSearchCV)
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                             f1_score, confusion_matrix, roc_auc_score, silhouette_score)
+                              f1_score, confusion_matrix, roc_auc_score,
+                              silhouette_score, classification_report)
 from sklearn.preprocessing import label_binarize, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from groq import Groq
@@ -58,6 +63,12 @@ html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
      padding:.7rem 1rem;color:#93c5fd;font-size:.83rem;margin-bottom:.4rem;}
 .bp {background:#0f0a1a;border:1px solid #7c3aed;border-radius:8px;
      padding:.7rem 1rem;color:#c4b5fd;font-size:.83rem;margin-bottom:.4rem;}
+.priority-critical{background:#1a0505;border:1px solid #dc2626;border-radius:8px;
+     padding:.6rem 1rem;color:#fca5a5;font-size:.83rem;margin-bottom:.3rem;}
+.priority-high{background:#1a0f00;border:1px solid #d97706;border-radius:8px;
+     padding:.6rem 1rem;color:#fcd34d;font-size:.83rem;margin-bottom:.3rem;}
+.priority-monitor{background:#001a05;border:1px solid #16a34a;border-radius:8px;
+     padding:.6rem 1rem;color:#86efac;font-size:.83rem;margin-bottom:.3rem;}
 .cc {background:#0f172a;border:1px solid #334155;border-radius:10px;
      padding:.9rem 1.1rem;margin-bottom:.5rem;}
 .stButton>button{background:#1e3a5f;color:#f1f5f9;border:1px solid #3b82f6;
@@ -70,7 +81,7 @@ html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
 st.markdown("""
 <div class="hdr">
   <h1>🎓 CS Department Intelligence System</h1>
-  <p>Random Forest · SHAP · KMeans Clustering · TF-IDF NLP · BERT Embeddings · AI Reports</p>
+  <p>Random Forest · SHAP · KMeans Clustering · TF-IDF NLP · BERT Embeddings · AI Reports · v6</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -87,9 +98,10 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Tab 2 — Job Market:**")
     bert_on        = st.toggle("Enable BERT (Sentence-BERT)", value=False)
-    bert_name      = st.selectbox("BERT model:", ["all-MiniLM-L6-v2", "all-mpnet-base-v2"], index=0)
-    bert_threshold = st.slider("BERT similarity threshold:", 0.30, 0.70, 0.45, 0.05,
-                               help="Job considered to mention a skill if cosine similarity ≥ threshold")
+    bert_name      = st.selectbox("BERT model:",
+                                   ["all-MiniLM-L6-v2", "all-mpnet-base-v2"], index=0)
+    bert_threshold = st.slider("BERT similarity threshold:",
+                                0.30, 0.70, 0.45, 0.05)
     st.caption("Requires: pip install sentence-transformers")
     st.markdown("---")
     st.markdown("**Each tab is independent.**")
@@ -126,44 +138,60 @@ def compute_auc(model, X_te, y_te, classes):
     except Exception:
         return None
 
-# ── SHAP: يعمل على numpy array لتجنب مشاكل الـ index ──
 def compute_shap(model, X_te_df, features):
     """
-    يرجع (mean_abs_shap, mean_signed_shap):
-    - mean_abs  → حجم التأثير (للرسمة الرئيسية)
-    - mean_sign → اتجاه التأثير بالنسبة لكلاس 'Excellent'
-                  موجب = يرفع احتمال Excellent، سالب = يخفضه
-    نستخدم model.classes_ للعثور على index الكلاس الصحيح
-    بدل افتراض آخر عنصر في القائمة.
+    يرجع (mean_abs_shap, mean_signed_shap, sv_exc):
+    - mean_abs  → حجم التأثير
+    - mean_sign → اتجاه التأثير بالنسبة لـ Excellent
+    - sv_exc    → raw SHAP values للـ Excellent (لحساب positive_ratio)
+    يستخدم model.classes_ للدقة
     """
     try:
-        arr = np.array(X_te_df.values[:min(50, len(X_te_df))], dtype=float)
-        exp = shap.TreeExplainer(model)
-        sv  = exp.shap_values(arr)
-
-        # نحدد index كلاس Excellent بدقة
+        arr     = np.array(X_te_df.values[:min(50, len(X_te_df))], dtype=float)
+        exp     = shap.TreeExplainer(model)
+        sv      = exp.shap_values(arr)
         classes = list(model.classes_)
         exc_idx = classes.index('Excellent') if 'Excellent' in classes else len(classes)-1
 
         if isinstance(sv, list):
-            # list of (n_samples, n_features) — واحد لكل كلاس
-            stacked  = np.stack([np.abs(s) for s in sv], axis=0)  # (n_classes, n, f)
-            mean_abs = stacked.mean(axis=0).mean(axis=0)            # (n_features,)
-            mean_sign = sv[exc_idx].mean(axis=0)                    # (n_features,) للـ Excellent
+            stacked   = np.stack([np.abs(s) for s in sv], axis=0)
+            mean_abs  = stacked.mean(axis=0).mean(axis=0)
+            sv_exc    = sv[exc_idx]
+            mean_sign = sv_exc.mean(axis=0)
         elif sv.ndim == 3:
-            # (n_samples, n_features, n_classes)
-            mean_abs  = np.abs(sv).mean(axis=0).mean(axis=1)        # (n_features,)
-            mean_sign = sv[:, :, exc_idx].mean(axis=0)              # (n_features,)
+            mean_abs  = np.abs(sv).mean(axis=0).mean(axis=1)
+            sv_exc    = sv[:, :, exc_idx]
+            mean_sign = sv_exc.mean(axis=0)
         else:
-            # binary
             mean_abs  = np.abs(sv).mean(axis=0)
+            sv_exc    = sv
             mean_sign = sv.mean(axis=0)
 
         abs_s  = pd.Series(mean_abs,  index=features).sort_values(ascending=False)
         sign_s = pd.Series(mean_sign, index=features)
-        return abs_s, sign_s
+        pr_s   = pd.Series((sv_exc > 0).mean(axis=0), index=features)
+        return abs_s, sign_s, pr_s
     except Exception as e:
-        return str(e), None
+        return str(e), None, None
+
+def compute_course_priority(fr, shap_v, imps, courses):
+    """
+    Course Priority Score = 0.5*norm_fail + 0.3*norm_shap + 0.2*norm_rf
+    يجمع الأدلة الثلاثة في score واحد قابل للمقارنة
+    مستند علمياً على: fail_rate (impact on students) +
+    SHAP (causal influence) + RF importance (model dependency)
+    """
+    max_fail = max(fr.values()) / 100 if fr else 1
+    max_shap = float(shap_v.max()) if shap_v is not None else 1
+    max_rf   = float(imps.max())   if len(imps) > 0 else 1
+
+    scores = {}
+    for c in courses:
+        norm_fail = (fr.get(c, 0) / 100) / max_fail if max_fail > 0 else 0
+        norm_shap = float(shap_v.get(c, 0)) / max_shap if (shap_v is not None and max_shap > 0) else 0
+        norm_rf   = float(imps.get(c, 0))   / max_rf   if max_rf > 0 else 0
+        scores[c] = round(0.5*norm_fail + 0.3*norm_shap + 0.2*norm_rf, 4)
+    return scores
 
 def call_groq(key, prompt, max_tokens=2500):
     try:
@@ -195,11 +223,12 @@ def dark_fig(figsize):
 
 def metric_card(col, label, value):
     col.markdown(
-        f'<div class="mc"><div class="v">{value}</div><div class="l">{label}</div></div>',
+        f'<div class="mc"><div class="v">{value}</div>'
+        f'<div class="l">{label}</div></div>',
         unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════
-# TAXONOMY for NLP
+# TAXONOMY
 # ══════════════════════════════════════════════════
 TAXONOMY = {
     "Programming Languages": ["python","java","javascript","c++","c#","kotlin","swift",
@@ -216,15 +245,17 @@ TAXONOMY = {
     "Cybersecurity":         ["cybersecurity","penetration testing","network security",
                                "encryption","identity access management","firewall","siem",
                                "ethical hacking","vulnerability assessment","security audit"],
-    "Databases":             ["mysql","postgresql","oracle","sql server","redis","elasticsearch",
-                               "cassandra","database design","data modeling","data warehouse"],
+    "Databases":             ["mysql","postgresql","oracle","sql server","redis",
+                               "elasticsearch","cassandra","database design",
+                               "data modeling","data warehouse"],
     "Software Engineering":  ["agile","scrum","rest api","microservices","design patterns",
                                "software architecture","unit testing","test driven development",
                                "version control","code review","continuous integration"],
     "Networking":            ["networking","tcp/ip","routing","switching","vpn",
                                "network administration","cisco","wireshark","network protocols"],
-    "Emerging Tech":         ["blockchain","iot","embedded systems","computer vision","robotics",
-                               "large language model","generative ai","ar/vr","edge computing","5g"],
+    "Emerging Tech":         ["blockchain","iot","embedded systems","computer vision",
+                               "robotics","large language model","generative ai",
+                               "ar/vr","edge computing","5g"],
 }
 
 CAT_COLORS = {
@@ -249,7 +280,7 @@ with tab1:
     st.markdown(
         '<div class="bb">Upload <b>any</b> grades CSV. '
         'Suggested course columns shown — <b>verify and adjust manually</b> before running. '
-        'RF trained on 80%, evaluated on 20%. '
+        'RF trained on 80% (stratified), evaluated on 20%. '
         'class_weight auto-selected by F1. SHAP sampled for speed.</div>',
         unsafe_allow_html=True)
 
@@ -265,7 +296,6 @@ with tab1:
         st.markdown("---")
         num_cols = df_raw.select_dtypes(include='number').columns.tolist()
 
-        # ── FIX 4: auto_c كاقتراح فقط — المستخدم يراجع ويعدّل ──
         skip_kw = ['id','rank','student','semester','final','total','gpa','grade','index']
         auto_c  = [c for c in num_cols if not any(k in c.lower() for k in skip_kw)]
 
@@ -279,8 +309,7 @@ with tab1:
         with c1:
             course_cols = st.multiselect(
                 "Course columns (model features) — verify before running:",
-                options=num_cols,
-                default=auto_c)
+                options=num_cols, default=auto_c)
         with c2:
             final_col = st.selectbox(
                 "Final grade column (classification target):",
@@ -290,20 +319,19 @@ with tab1:
         t1, t2, t3 = st.columns(3)
         with t1:
             thresh_mode = st.radio("Threshold mode:",
-                ["Fixed score", "Quantile (data-driven)"], index=0,
-                help="Fixed: you set the cutoffs. Quantile: bottom/top X% of students.")
+                ["Fixed score", "Quantile (data-driven)"], index=0)
         with t2:
             if thresh_mode == "Fixed score":
                 wt = st.slider("Weak: score below", 30, 70, 60)
             else:
                 wq = st.slider("Weak: bottom %", 5, 40, 25)
-                wt = None  # سيُحسب بعد التقسيم
+                wt = None
         with t3:
             if thresh_mode == "Fixed score":
                 at = st.slider("Average: score below", 65, 90, 75)
             else:
                 aq = st.slider("Excellent: top %", 10, 40, 25)
-                at = None  # سيُحسب بعد التقسيم
+                at = None
 
         if st.button("🔍 Run Analysis", key="b1_run"):
             if len(course_cols) < 2:
@@ -315,27 +343,41 @@ with tab1:
 
             df = df_raw.copy()
 
-            # ── Train / Test split أولاً ──
+            # ── Thresholds مؤقتة للـ stratified split ──
+            if thresh_mode == "Fixed score":
+                wt_tmp, at_tmp = wt, at
+            else:
+                wt_tmp, at_tmp = 60, 75  # مؤقت فقط
+
+            def classify_tmp(g):
+                if g < wt_tmp:  return 'Weak'
+                elif g < at_tmp: return 'Average'
+                return 'Excellent'
+
+            # ══ FIX 1: STRATIFIED SPLIT ══
+            # نصنف مؤقتاً عشان نعمل stratified
             X     = df[course_cols]
             y_raw = df[final_col]
-            Xtr, Xte, ytr_r, yte_r = train_test_split(
-                X, y_raw, test_size=0.2, random_state=42)
+            y_labels_temp = y_raw.apply(classify_tmp)
 
-            # ── Thresholds: إما fixed أو quantile من Train فقط ──
+            Xtr, Xte, ytr_r, yte_r = train_test_split(
+                X, y_raw, test_size=0.2,
+                random_state=42,
+                stratify=y_labels_temp)  # ← stratified يحافظ على نسب الكلاسات
+
+            # ── Thresholds الحقيقية بعد التقسيم ──
             if thresh_mode == "Quantile (data-driven)":
                 wt = float(np.percentile(ytr_r, wq))
                 at = float(np.percentile(ytr_r, 100 - aq))
-                st.info(f"📊 Quantile thresholds (from training set): "
+                st.info(f"📊 Quantile thresholds (from training set only): "
                         f"Weak < {wt:.1f} | Excellent ≥ {at:.1f}")
-            # wt و at محددتين يدوياً إذا Fixed
 
-            # classify uses thresholds computed/set before training
             def classify(g):
                 if g < wt:   return 'Weak'
                 elif g < at: return 'Average'
                 return 'Excellent'
 
-            # ── Descriptive stats — نسخة display منفصلة عن التدريب ──
+            # ── Descriptive stats ──
             st.caption("ℹ️ Descriptive stats computed on full dataset — display only, not used in training.")
             df_display = df.copy()
             df_display['Level'] = df_display[final_col].apply(classify)
@@ -346,17 +388,13 @@ with tab1:
             mc   = avgs[(avgs >= wt) & (avgs < at)]
             gc   = avgs[avgs >= at]
 
-            # Labels applied AFTER split — لا يُستخدم df_display في التدريب
             ytr = ytr_r.apply(classify)
             yte = yte_r.apply(classify)
 
-            # ── RF: RandomizedSearchCV على Train فقط ──
+            # ══ RF + RandomizedSearchCV ══
             with st.spinner("Training models — RF tuning + LR baseline..."):
-                from sklearn.linear_model    import LogisticRegression
-                from sklearn.pipeline        import make_pipeline
-                from sklearn.model_selection import RandomizedSearchCV
 
-                # اختيار class_weight بـ CV على Train (بدون لمس Test)
+                # اختيار class_weight بـ CV على Train فقط
                 best_cw_label = 'balanced'
                 best_cv_f1    = -1
                 for cw, cw_label in [('balanced', 'balanced'), (None, 'none')]:
@@ -368,7 +406,6 @@ with tab1:
                         best_cv_f1    = cv_f1
                         best_cw_label = cw_label
 
-                # RandomizedSearchCV للـ hyperparameter tuning — على Train فقط
                 param_dist = {
                     'n_estimators':      [100, 200],
                     'max_depth':         [None, 5, 10, 15],
@@ -382,8 +419,8 @@ with tab1:
                     rf_base, param_dist, n_iter=12, cv=3,
                     scoring='f1_weighted', random_state=42, n_jobs=-1)
                 rscv.fit(Xtr, ytr)
-                rf  = rscv.best_estimator_
-                ypr = rf.predict(Xte)
+                rf          = rscv.best_estimator_
+                ypr         = rf.predict(Xte)
                 best_params = rscv.best_params_
 
                 # LR baseline
@@ -392,10 +429,11 @@ with tab1:
                     LogisticRegression(max_iter=1000, random_state=42,
                                        class_weight='balanced'))
                 lr_pipe.fit(Xtr, ytr)
-                ypr_lr  = lr_pipe.predict(Xte)
-                f1_lr   = f1_score(ypr_lr,  yte, average='weighted', zero_division=0)
-                acc_lr  = accuracy_score(yte, ypr_lr)
+                ypr_lr = lr_pipe.predict(Xte)
+                f1_lr  = f1_score(ypr_lr, yte, average='weighted', zero_division=0)
+                acc_lr = accuracy_score(yte, ypr_lr)
 
+            # ══ Metrics ══
             acc  = accuracy_score(yte, ypr)
             prec = precision_score(yte, ypr, average='weighted', zero_division=0)
             rec  = recall_score(yte, ypr,    average='weighted', zero_division=0)
@@ -405,66 +443,63 @@ with tab1:
             cls  = sorted(ytr.unique())
             auc  = compute_auc(rf, Xte.values, yte, cls)
 
-            # Early Warning: predict_proba للـ risk score
-            yproba = rf.predict_proba(Xte)
-            cls_list = list(rf.classes_)
-            weak_idx = cls_list.index('Weak') if 'Weak' in cls_list else 0
-            risk_scores = yproba[:, weak_idx]  # احتمال الضعف لكل طالب في Test
+            # Early Warning
+            yproba    = rf.predict_proba(Xte)
+            cls_list  = list(rf.classes_)
+            weak_idx  = cls_list.index('Weak') if 'Weak' in cls_list else 0
+            risk_scores = yproba[:, weak_idx]
 
-            # ── SHAP ──
+            # ══ SHAP ══
             with st.spinner("Computing SHAP values..."):
                 shap_result = compute_shap(rf, Xte, course_cols)
-                if isinstance(shap_result, tuple):
-                    shap_v, shap_sign = shap_result
+                if isinstance(shap_result, tuple) and len(shap_result) == 3:
+                    shap_v, shap_sign, shap_pos_ratio = shap_result
                     if isinstance(shap_v, str):
-                        shap_v, shap_sign = None, None
+                        shap_v = shap_sign = shap_pos_ratio = None
                 else:
-                    shap_v, shap_sign = None, None
+                    shap_v = shap_sign = shap_pos_ratio = None
 
-            # ── Fix 3: SHAP positive_ratio ──
-            shap_pos_ratio = None
-            if shap_v is not None:
-                try:
-                    arr = np.array(Xte.values[:min(50, len(Xte))], dtype=float)
-                    exp = shap.TreeExplainer(rf)
-                    sv  = exp.shap_values(arr)
-                    exc_idx = cls_list.index('Excellent') if 'Excellent' in cls_list else -1
-                    if isinstance(sv, list):
-                        sv_exc = sv[exc_idx]
-                    elif sv.ndim == 3:
-                        sv_exc = sv[:, :, exc_idx]
-                    else:
-                        sv_exc = sv
-                    # نسبة الطلاب حيث هذه المادة تساعد على Excellent
-                    pos_ratio = (sv_exc > 0).mean(axis=0)
-                    shap_pos_ratio = pd.Series(pos_ratio, index=course_cols)
-                except Exception:
-                    shap_pos_ratio = None
+            # ══ FIX 2: COURSE PRIORITY SCORE ══
+            course_priority = compute_course_priority(fr, shap_v, imps, course_cols)
+            priority_df = pd.DataFrame([
+                {
+                    'Course': c,
+                    'Priority Score': score,
+                    'Fail Rate %': round(fr.get(c, 0), 1),
+                    '|SHAP|': round(float(shap_v.get(c, 0)), 4) if shap_v is not None else 0,
+                    'RF Importance': round(float(imps.get(c, 0)), 4),
+                    'Level': ('🔴 Critical' if score > 0.6 else
+                              '🟡 High' if score > 0.35 else
+                              '🟢 Monitor')
+                }
+                for c, score in sorted(course_priority.items(),
+                                       key=lambda x: x[1], reverse=True)
+            ])
 
-            # ── Fix 2: KMeans على Train فقط ثم assign للباقي ──
+            # ══ KMeans ══
             with st.spinner("Running KMeans Clustering..."):
                 X_all   = df[course_cols].fillna(df[course_cols].mean())
                 X_tr_cl = X_all.iloc[Xtr.index]
                 X_te_cl = X_all.iloc[Xte.index]
 
                 scaler = StandardScaler()
-                scaler.fit(X_tr_cl)
-                Xs_tr = scaler.transform(X_tr_cl)
-                Xs_te = scaler.transform(X_te_cl)
-                Xs_all = scaler.transform(X_all)   # للرسم فقط
+                scaler.fit(X_tr_cl)          # fit على Train فقط
+                Xs_tr  = scaler.transform(X_tr_cl)
+                Xs_te  = scaler.transform(X_te_cl)
+                Xs_all = scaler.transform(X_all)
 
                 ks = range(2, max_k + 1)
                 inert, silhs = [], []
                 for k in ks:
                     km_tmp = KMeans(n_clusters=k, random_state=42, n_init=10)
-                    lb     = km_tmp.fit_predict(Xs_tr)   # fit على Train فقط
+                    lb     = km_tmp.fit_predict(Xs_tr)
                     inert.append(km_tmp.inertia_)
                     silhs.append(silhouette_score(Xs_tr, lb))
 
                 best_k = list(ks)[np.argmax(silhs)]
                 km_f   = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-                km_f.fit(Xs_tr)                           # تدريب على Train
-                # assign للكل بعد التدريب
+                km_f.fit(Xs_tr)
+
                 df.loc[Xtr.index, 'Cluster'] = km_f.predict(Xs_tr)
                 df.loc[Xte.index, 'Cluster'] = km_f.predict(Xs_te)
                 df['Cluster'] = df['Cluster'].astype(int)
@@ -477,8 +512,8 @@ with tab1:
                 prof['avg'] = prof.mean(axis=1)
                 prof = prof.sort_values('avg', ascending=False)
 
-                lmap = {}
-                n_cl = len(prof)
+                lmap  = {}
+                n_cl  = len(prof)
                 for i, cid in enumerate(prof.index):
                     if i == 0:        lmap[cid] = "🏆 High Performers"
                     elif i == n_cl-1: lmap[cid] = "🚨 At Risk"
@@ -488,9 +523,7 @@ with tab1:
                 df['CL'] = df['Cluster'].map(lmap)
 
             # ══════════════════ DISPLAY ══════════════════
-
             st.markdown("---")
-            # KPI row
             kpi_cols = st.columns(6)
             for col, (l, v) in zip(kpi_cols, [
                 ("Students",  len(df)),
@@ -505,7 +538,6 @@ with tab1:
             # ── Charts ──
             st.markdown("---")
             ch1, ch2 = st.columns(2)
-
             with ch1:
                 st.markdown("**Course Average Scores**")
                 bc = ['#dc2626' if v<wt else '#d97706' if v<at else '#16a34a' for v in avgs.values]
@@ -544,7 +576,8 @@ with tab1:
                 if len(wc):
                     for c, v in wc.items():
                         st.markdown(
-                            f'<div class="br"><b>{c}</b><br>Avg:{v:.1f} · Fail:{fr[c]:.1f}%</div>',
+                            f'<div class="br"><b>{c}</b><br>'
+                            f'Avg:{v:.1f} · Fail:{fr[c]:.1f}%</div>',
                             unsafe_allow_html=True)
                 else:
                     st.success("None")
@@ -553,7 +586,8 @@ with tab1:
                 if len(mc):
                     for c, v in mc.items():
                         st.markdown(
-                            f'<div class="ba"><b>{c}</b><br>Avg:{v:.1f} · Fail:{fr[c]:.1f}%</div>',
+                            f'<div class="ba"><b>{c}</b><br>'
+                            f'Avg:{v:.1f} · Fail:{fr[c]:.1f}%</div>',
                             unsafe_allow_html=True)
                 else:
                     st.success("None")
@@ -564,12 +598,35 @@ with tab1:
                         f'<div class="bg"><b>{c}</b> · Avg:{v:.1f}</div>',
                         unsafe_allow_html=True)
 
+            # ══ FIX 2 DISPLAY: COURSE PRIORITY MATRIX ══
+            st.markdown("---")
+            st.markdown("#### 📊 Course Priority Matrix")
+            st.caption(
+                "Priority Score = 0.5 × norm(fail_rate) + 0.3 × norm(|SHAP|) + 0.2 × norm(RF importance). "
+                "Combines three independent evidence sources into one actionable ranking.")
+
+            for _, row in priority_df.iterrows():
+                css_class = ('priority-critical' if row['Level'] == '🔴 Critical'
+                             else 'priority-high' if row['Level'] == '🟡 High'
+                             else 'priority-monitor')
+                st.markdown(
+                    f'<div class="{css_class}">'
+                    f'<b>{row["Course"]}</b> &nbsp;·&nbsp; '
+                    f'Score: <b>{row["Priority Score"]:.3f}</b> &nbsp;·&nbsp; '
+                    f'Fail: {row["Fail Rate %"]}% &nbsp;·&nbsp; '
+                    f'|SHAP|: {row["|SHAP|"]} &nbsp;·&nbsp; '
+                    f'RF: {row["RF Importance"]} &nbsp;·&nbsp; '
+                    f'{row["Level"]}'
+                    f'</div>',
+                    unsafe_allow_html=True)
+
             # ── ML Metrics ──
             st.markdown("---")
             st.markdown("#### 🤖 Random Forest Results")
             st.caption(
                 f"Train: {len(Xtr)} students (80%) · Test: {len(Xte)} students (20%) · "
-                f"class_weight={best_cw_label} (chosen by 5-fold CV F1 on train — no test leakage)")
+                f"**Stratified split** (preserves class ratios) · "
+                f"class_weight={best_cw_label} (5-fold CV F1 on train only — no test leakage)")
 
             m_cols = st.columns(6)
             for col, (l, v) in zip(m_cols, [
@@ -582,25 +639,26 @@ with tab1:
             ]):
                 metric_card(col, l, v)
 
-            # LR baseline comparison
+            # LR comparison
             with st.expander("📊 Model Comparison — RF vs Logistic Regression baseline"):
                 comp_data = {
                     'Model': ['Random Forest (proposed)', 'Logistic Regression (baseline)'],
                     'Accuracy': [f"{acc*100:.1f}%", f"{acc_lr*100:.1f}%"],
                     'F1-Score': [f"{f1*100:.1f}%", f"{f1_lr*100:.1f}%"],
                     'Advantage': [
-                        'Feature importance + SHAP explainability',
+                        'Feature importance + SHAP + course-level diagnosis',
                         'Simple, interpretable, fast baseline'
                     ]
                 }
                 st.table(pd.DataFrame(comp_data))
                 delta = (f1 - f1_lr) * 100
                 if delta > 0:
-                    st.success(f"✅ RF outperforms LR baseline by {delta:.1f}% F1 — justifies complexity.")
+                    st.success(f"✅ RF outperforms LR by {delta:.1f}% F1.")
                 else:
-                    st.warning(f"⚠️ LR baseline matches or beats RF by {abs(delta):.1f}% F1 — consider simpler model.")
+                    st.warning(f"⚠️ LR beats RF by {abs(delta):.1f}% F1 — "
+                               f"RF retained for SHAP explainability and course diagnosis.")
 
-            # Confusion Matrix
+            # Confusion Matrix + Classification Report
             st.markdown("**Confusion Matrix (test set)**")
             lbls = sorted(yte.unique())
             cm_m = confusion_matrix(yte, ypr, labels=lbls)
@@ -617,6 +675,12 @@ with tab1:
             ax3.set_ylabel('Actual',    color='#94a3b8')
             plt.tight_layout(); st.pyplot(fig3); plt.close()
 
+            with st.expander("📋 Full Classification Report (per-class metrics)"):
+                report_str = classification_report(yte, ypr, zero_division=0)
+                st.code(report_str)
+                st.caption("Per-class precision/recall/F1 — "
+                           "more informative than weighted average under class imbalance.")
+
             # Feature Importance + SHAP
             fi_c, sh_c = st.columns(2)
             with fi_c:
@@ -627,94 +691,107 @@ with tab1:
                          color=['#3b82f6' if v > imps.mean() else '#334155' for v in ti.values],
                          height=.6)
                 ax4.axvline(imps.mean(), color='#d97706', linestyle='--', lw=1)
-                ax4.set_title('How often each course splits the trees', color='#94a3b8', fontsize=8)
+                ax4.set_title('How often each course splits the trees',
+                              color='#94a3b8', fontsize=8)
                 plt.tight_layout(); st.pyplot(fig4); plt.close()
 
             with sh_c:
                 st.markdown("**SHAP — magnitude + direction + % cases**")
                 if shap_v is not None:
                     ts = shap_v.sort_values(ascending=True)
-                    colors_shap = []
-                    for feat in ts.index:
-                        d_val = shap_sign.get(feat, 0) if shap_sign is not None else 0
-                        colors_shap.append('#16a34a' if d_val >= 0 else '#dc2626')
+                    colors_shap = [
+                        '#16a34a' if (shap_sign.get(f, 0) >= 0) else '#dc2626'
+                        for f in ts.index
+                    ]
                     fig5, ax5 = dark_fig((7, max(4, len(course_cols)*.4)))
                     ax5.barh(ts.index, ts.values, color=colors_shap, height=.6)
                     ax5.axvline(shap_v.mean(), color='#d97706', linestyle='--', lw=1)
                     ax5.set_title('mean|SHAP|  🟢=helps Excellent  🔴=hurts',
                                   color='#94a3b8', fontsize=8)
                     plt.tight_layout(); st.pyplot(fig5); plt.close()
+
                     rows_shap = []
                     for c in shap_v.index[:10]:
                         d_val = shap_sign.get(c, 0) if shap_sign is not None else 0
-                        pr    = shap_pos_ratio.get(c, float('nan')) if shap_pos_ratio is not None else float('nan')
+                        pr    = (shap_pos_ratio.get(c, float('nan'))
+                                 if shap_pos_ratio is not None else float('nan'))
                         rows_shap.append({
                             'Course': c,
                             '|SHAP|': round(float(shap_v[c]), 4),
                             'Direction': '🟢 Excellent' if d_val >= 0 else '🔴 Weak/Avg',
                             '% helps': f"{pr*100:.0f}%" if not np.isnan(pr) else '—'
                         })
-                    st.dataframe(pd.DataFrame(rows_shap), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(rows_shap),
+                                 hide_index=True, use_container_width=True)
                 else:
                     st.info("SHAP not available.")
 
             with st.expander("📐 Metrics & Design Decisions"):
                 st.markdown(f"""
-| Metric | Value | Formula | When to trust |
-|--------|-------|---------|---------------|
-| Accuracy  | {acc*100:.1f}%  | (TP+TN)/all | Good when classes are balanced |
-| Precision | {prec*100:.1f}% | TP/(TP+FP)  | Avoid labelling good students as Weak |
+| Metric | Value | Formula | Note |
+|--------|-------|---------|------|
+| Accuracy  | {acc*100:.1f}%  | (TP+TN)/all | Misleading with imbalance |
+| Precision | {prec*100:.1f}% | TP/(TP+FP)  | Avoid false Weak labels |
 | Recall    | {rec*100:.1f}%  | TP/(TP+FN)  | Don't miss at-risk students |
-| F1        | {f1*100:.1f}%   | 2·P·R/(P+R) | Best single metric with imbalance |
-| CV Acc.   | {cv*100:.1f}%   | 5-fold mean | Stability — close to Accuracy = no overfit |
-| AUC-ROC   | {f"{auc*100:.1f}%" if auc else "N/A"} | Area under ROC | Threshold-independent quality |
+| F1        | {f1*100:.1f}%   | 2·P·R/(P+R) | **Primary metric** — handles imbalance |
+| CV Acc.   | {cv*100:.1f}%   | 5-fold mean | Overfitting check |
+| AUC-ROC   | {f"{auc*100:.1f}%" if auc else "N/A"} | Area under ROC | Threshold-independent |
 
-**Best RF hyperparameters (RandomizedSearchCV, 3-fold CV on train):**
-`{best_params}`
+**Best RF params (RandomizedSearchCV, 3-fold CV on train only):** `{best_params}`
 
-**class_weight selected:** `{best_cw_label}` — 5-fold CV F1 on train only. No test leakage.
+**class_weight:** `{best_cw_label}` — selected by 5-fold CV F1, no test leakage.
 
-**SHAP direction guide:**
-- 🟢 Green = higher grade → pushes toward Excellent
-- 🔴 Red   = higher grade → pushes toward Weak/Average
-- % column = % of test students where this course helped Excellent
+**Split:** Stratified 80/20 — preserves Weak/Average/Excellent ratios in both sets.
 
-**Clustering:** KMeans fitted on training rows only. Test rows assigned via predict().
-This prevents any test-set information from influencing cluster centres.
+**SHAP direction:** 🟢 = higher grade → pushes toward Excellent | 🔴 = hurts Excellent
 
-**LR Baseline:** RF advantage = {(f1-f1_lr)*100:.1f}% F1.
+**Priority Score formula:**
+`0.5 × norm(fail_rate) + 0.3 × norm(|SHAP|) + 0.2 × norm(RF importance)`
+Higher weight on fail_rate (most direct evidence of difficulty).
                 """)
 
-
-            # ── Early Warning: Risk Scores ──
+            # ── Early Warning ──
             st.markdown("---")
             st.markdown("#### 🚨 Early Warning — Student Risk Scores (Test Set)")
-            st.caption("Risk = predicted probability of being classified as 'Weak'. "
-                       "Based on model trained on 80% of data.")
+            st.caption("Risk = predicted probability of Weak classification. "
+                       "Model trained on 80% only.")
+
             risk_df = pd.DataFrame({
-                'Student#': range(1, len(Xte)+1),
-                'Risk %':   (risk_scores * 100).round(1),
-                'Actual':   yte.values,
+                'Student#':  range(1, len(Xte)+1),
+                'Risk %':    (risk_scores * 100).round(1),
+                'Actual':    yte.values,
                 'Predicted': ypr,
             }).sort_values('Risk %', ascending=False)
             high_risk = risk_df[risk_df['Risk %'] >= 50]
+
             r1, r2, r3 = st.columns(3)
             r1.metric("High Risk (≥50%)", len(high_risk), delta_color="inverse")
             r2.metric("Avg Risk Score",   f"{risk_scores.mean()*100:.1f}%")
             r3.metric("Max Risk Score",   f"{risk_scores.max()*100:.1f}%")
+
+            # Risk distribution chart
+            fig_r, ax_r = dark_fig((8, 3))
+            ax_r.hist(risk_scores * 100, bins=20, color='#3b82f6',
+                      edgecolor='#0f172a', alpha=0.8)
+            ax_r.axvline(50, color='#dc2626', linestyle='--', lw=1.5, label='High Risk threshold (50%)')
+            ax_r.set_xlabel('Risk Score %', color='#94a3b8')
+            ax_r.set_ylabel('# Students',   color='#94a3b8')
+            ax_r.set_title('Risk Score Distribution (Test Set)',
+                            color='#f1f5f9', fontsize=10)
+            ax_r.legend(fontsize=8, facecolor='#0f172a', labelcolor='#94a3b8')
+            plt.tight_layout(); st.pyplot(fig_r); plt.close()
+
             with st.expander(f"📋 Top {min(20, len(risk_df))} Highest-Risk Students"):
                 st.dataframe(risk_df.head(20), hide_index=True, use_container_width=True)
 
-            # ════════════════════
-            # CLUSTERING
-            # ════════════════════
+            # ── Clustering ──
             st.markdown("---")
             st.markdown("#### 🔵 KMeans Student Clustering")
             best_sil = max(silhs)
             st.markdown(
                 f'<div class="bp">KMeans found <b>{best_k} natural student groups</b> '
-                f'(silhouette = {best_sil:.3f}, chosen by argmax silhouette across k=2..{max_k}). '
-                f'Scaler fitted on training rows only.</div>',
+                f'(silhouette = {best_sil:.3f}, chosen by argmax silhouette across '
+                f'k=2..{max_k}). Scaler + KMeans fitted on training rows only.</div>',
                 unsafe_allow_html=True)
 
             for cid, label in lmap.items():
@@ -725,14 +802,14 @@ This prevents any test-set information from influencing cluster centres.
                 st.markdown(
                     f'<div class="cc">'
                     f'<b style="color:#f1f5f9">{label}</b> &nbsp;·&nbsp; '
-                    f'<span style="color:#64748b">{n_c} students ({n_c/len(df)*100:.0f}%)</span> &nbsp;·&nbsp; '
+                    f'<span style="color:#64748b">{n_c} students '
+                    f'({n_c/len(df)*100:.0f}%)</span> &nbsp;·&nbsp; '
                     f'<span style="color:#3b82f6">Avg: {avg_c:.1f}</span> &nbsp;·&nbsp; '
                     f'<span style="color:#16a34a">Best: {b_c}</span> &nbsp;·&nbsp; '
                     f'<span style="color:#dc2626">Weakest: {w_c}</span>'
                     f'</div>',
                     unsafe_allow_html=True)
 
-            # Elbow + Silhouette
             fig_el, (ax_e, ax_s) = plt.subplots(1, 2, figsize=(12, 4))
             fig_el.patch.set_facecolor('#0f172a')
             for ax in [ax_e, ax_s]:
@@ -740,18 +817,23 @@ This prevents any test-set information from influencing cluster centres.
                 ax.tick_params(colors='#94a3b8')
                 ax.spines[:].set_color('#1e3a5f')
             ax_e.plot(list(ks), inert, 'o-', color='#3b82f6', lw=2)
-            ax_e.axvline(best_k, color='#d97706', linestyle='--', lw=1.5, label=f'Best k={best_k}')
-            ax_e.set_xlabel('k', color='#94a3b8'); ax_e.set_ylabel('Inertia', color='#94a3b8')
+            ax_e.axvline(best_k, color='#d97706', linestyle='--', lw=1.5,
+                         label=f'Best k={best_k}')
+            ax_e.set_xlabel('k', color='#94a3b8')
+            ax_e.set_ylabel('Inertia', color='#94a3b8')
             ax_e.set_title('Elbow Method', color='#f1f5f9', fontsize=10)
             ax_e.legend(fontsize=8, facecolor='#0f172a', labelcolor='#94a3b8')
             ax_s.bar(list(ks), silhs,
-                     color=['#d97706' if k==best_k else '#334155' for k in ks], width=.5)
-            ax_s.set_xlabel('k', color='#94a3b8'); ax_s.set_ylabel('Silhouette', color='#94a3b8')
-            ax_s.set_title('Silhouette Score (higher = better separation)', color='#f1f5f9', fontsize=10)
+                     color=['#d97706' if k==best_k else '#334155' for k in ks],
+                     width=.5)
+            ax_s.set_xlabel('k', color='#94a3b8')
+            ax_s.set_ylabel('Silhouette', color='#94a3b8')
+            ax_s.set_title('Silhouette Score (argmax → best k)',
+                            color='#f1f5f9', fontsize=10)
             plt.tight_layout(); st.pyplot(fig_el); plt.close()
 
-            # PCA scatter
-            CCOLORS = ['#3b82f6','#16a34a','#d97706','#dc2626','#7c3aed','#0891b2','#ec4899','#84cc16']
+            CCOLORS = ['#3b82f6','#16a34a','#d97706','#dc2626',
+                       '#7c3aed','#0891b2','#ec4899','#84cc16']
             fig_p, ax_p = dark_fig((9, 6))
             for cid, label in lmap.items():
                 mask = df['Cluster'] == cid
@@ -759,7 +841,8 @@ This prevents any test-set information from influencing cluster centres.
                              c=CCOLORS[cid % len(CCOLORS)],
                              label=f"C{cid}: {label} (n={mask.sum()})",
                              alpha=.75, s=50, edgecolors='none')
-            ax_p.set_title('Student Clusters — PCA 2D', color='#f1f5f9', fontsize=11)
+            ax_p.set_title('Student Clusters — PCA 2D',
+                            color='#f1f5f9', fontsize=11)
             ax_p.legend(fontsize=8, facecolor='#0f172a', labelcolor='#94a3b8')
             plt.tight_layout(); st.pyplot(fig_p); plt.close()
 
@@ -768,11 +851,11 @@ This prevents any test-set information from influencing cluster centres.
                 pd_prof.index = [lmap.get(i, f'C{i}') for i in pd_prof.index]
                 st.dataframe(pd_prof.round(1), use_container_width=True)
 
-            # ══ حفظ كل النتائج في session_state ══
-            # هذا يحل مشكلة ضياع النتائج عند الضغط على Generate Report
-            # نحفظ shap_v فقط إذا كانت Series حقيقية
-            shap_to_save      = shap_v    if (shap_v    is not None and isinstance(shap_v,    pd.Series)) else None
-            shap_sign_to_save = shap_sign if (shap_sign is not None and isinstance(shap_sign, pd.Series)) else None
+            # ══ حفظ في session_state ══
+            shap_to_save      = shap_v          if isinstance(shap_v,          pd.Series) else None
+            shap_sign_to_save = shap_sign        if isinstance(shap_sign,        pd.Series) else None
+            shap_pr_to_save   = shap_pos_ratio   if isinstance(shap_pos_ratio,   pd.Series) else None
+
             st.session_state['s1'] = {
                 'df': df, 'avgs': avgs, 'fr': fr,
                 'wc': wc, 'mc': mc, 'gc': gc,
@@ -781,92 +864,127 @@ This prevents any test-set information from influencing cluster centres.
                 'Xtr': Xtr, 'Xte': Xte, 'ytr': ytr, 'yte': yte, 'ypr': ypr,
                 'acc': acc, 'prec': prec, 'rec': rec, 'f1': f1,
                 'cv': cv, 'auc': auc, 'imps': imps,
-                'shap_v': shap_to_save, 'shap_sign': shap_sign_to_save,
+                'shap_v': shap_to_save,
+                'shap_sign': shap_sign_to_save,
+                'shap_pos_ratio': shap_pr_to_save,
                 'best_cw_label': best_cw_label,
+                'best_params': best_params,
                 'best_k': best_k, 'best_sil': max(silhs),
                 'lmap': lmap, 'ks': list(ks),
                 'inert': inert, 'silhs': silhs,
                 'f1_lr': f1_lr, 'acc_lr': acc_lr,
+                'course_priority': course_priority,
+                'priority_df': priority_df,
+                'risk_scores': risk_scores,
+                'risk_df': risk_df,
             }
             st.success("✅ Analysis complete — scroll down to generate the AI report.")
 
-        # ════════════════════
-        # AI REPORT — خارج if button بحيث لا يختفي عند أي تفاعل
-        # ════════════════════
+        # ══ AI REPORT ══
         if 's1' in st.session_state:
             s = st.session_state['s1']
             st.markdown("---")
             st.markdown("#### 🤖 AI Institutional Report")
             st.markdown(
-                '<div class="bb">The AI generates a <b>report based on the numbers above</b>. '
-                'All quantitative claims are grounded in computed data. '
-                '<b>Treat the output as a decision-support draft</b> — '
-                'verify recommendations with domain experts before acting.</div>',
+                '<div class="bb">The AI generates a report grounded in computed data. '
+                '<b>Treat as a decision-support draft</b> — verify with domain experts.</div>',
                 unsafe_allow_html=True)
 
             if not groq_key:
                 st.warning("⚠️ Add Groq API Key in the sidebar.")
             else:
                 if st.button("📋 Generate Student Performance Report", key="b1_report"):
-                    # نقرأ من session_state — لا نعيد التدريب
                     wc   = s['wc'];  mc   = s['mc'];  fr   = s['fr']
-                    imps = s['imps']; shap_v = s['shap_v']; shap_sign = s.get('shap_sign')
+                    imps = s['imps']; shap_v = s['shap_v']
                     acc  = s['acc']; prec = s['prec']; rec = s['rec']
                     f1   = s['f1'];  cv   = s['cv'];  auc = s['auc']
                     cnts = s['cnts']; df  = s['df']
-                    course_cols = s['course_cols']
+                    course_cols  = s['course_cols']
                     wt   = s['wt'];  at  = s['at']
                     Xtr  = s['Xtr']; Xte = s['Xte']
                     best_cw_label = s['best_cw_label']
-                    best_k = s['best_k']; best_sil = s['best_sil']
-                    lmap = s['lmap']
-                    f1_lr = s.get('f1_lr', 0)
+                    best_k        = s['best_k']
+                    best_sil      = s['best_sil']
+                    lmap          = s['lmap']
+                    f1_lr         = s.get('f1_lr', 0)
+                    course_priority = s.get('course_priority', {})
+                    risk_scores   = s.get('risk_scores', np.array([]))
+
+                    def shap_val_str(c):
+                        if shap_v is None: return "N/A"
+                        return f"{float(shap_v.get(c, 0)):.4f}"
+
+                    weak_str = "\n".join([
+                        f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%, "
+                        f"rf_importance={imps.get(c,0):.3f}, shap={shap_val_str(c)}, "
+                        f"priority_score={course_priority.get(c,0):.3f}"
+                        for c, v in wc.items()
+                    ]) or "None"
+
+                    mid_str = "\n".join([
+                        f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%"
+                        for c, v in mc.items()
+                    ]) or "None"
+
+                    cluster_str = "\n".join([
+                        f"- {lmap.get(cid,'?')}: {(df['Cluster']==cid).sum()} students, "
+                        f"avg={float(df[df['Cluster']==cid][course_cols].mean().mean()):.1f}, "
+                        f"weakest={df[df['Cluster']==cid][course_cols].mean().idxmin()}"
+                        for cid in sorted(lmap.keys())
+                    ])
+
+                    top5_imp = "\n".join([
+                        f"- {c}: {v:.3f}" for c, v in imps.head(5).items()])
+
+                    top3_priority = "\n".join([
+                        f"- {c}: score={score:.3f}, fail={fr.get(c,0):.1f}%"
+                        for c, score in sorted(
+                            course_priority.items(), key=lambda x: x[1], reverse=True)[:3]
+                    ])
+
+                    high_risk_n = (risk_scores >= 0.5).sum() if len(risk_scores) > 0 else 0
+
+                    # ══ FIX 3: CROSS-BRANCH LINKING ══
+                    market_context = ""
+                    if 's2' in st.session_state:
+                        s2_data = st.session_state['s2']
+                        top5_market = "\n".join([
+                            f"  - {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}, "
+                            f"coverage={d['job_coverage']:.1f}%"
+                            for s, d in s2_data['top30'][:5]
+                        ])
+                        market_context = f"""
+=== JOB MARKET DATA (from Branch B — cross-branch insight) ===
+Top 5 demanded skills:
+{top5_market}
+
+CROSS-BRANCH ALIGNMENT INSTRUCTION:
+For each weak course, identify if its subject maps to a high-demand market skill.
+A course that is BOTH academically weak AND maps to a high-demand skill = CRITICAL priority.
+Example: 'Operating_Systems' weak + 'linux/devops' high demand = highest urgency.
+This cross-branch alignment is the core institutional insight of this system.
+"""
 
                     with st.spinner("Generating AI report..."):
+                        prompt = f"""You are a senior academic consultant writing a formal institutional
+report for the Head of a Computer Science Department.
 
-                        def shap_val_str(c):
-                            if shap_v is None: return "N/A"
-                            return f"{float(shap_v.get(c, 0)):.4f}"
-
-                        weak_str = "\n".join([
-                            f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%, "
-                            f"rf_importance={imps.get(c,0):.3f}, shap={shap_val_str(c)}"
-                            for c, v in wc.items()
-                        ]) or "None"
-
-                        mid_str = "\n".join([
-                            f"- {c}: avg={v:.1f}, fail_rate={fr.get(c,0):.1f}%"
-                            for c, v in mc.items()
-                        ]) or "None"
-
-                        cluster_str = "\n".join([
-                            f"- {lmap.get(cid,'?')}: {(df['Cluster']==cid).sum()} students, "
-                            f"avg={float(df[df['Cluster']==cid][course_cols].mean().mean()):.1f}, "
-                            f"weakest_course={df[df['Cluster']==cid][course_cols].mean().idxmin()}"
-                            for cid in sorted(lmap.keys())
-                        ])
-
-                        top5_imp = "\n".join([f"- {c}: {v:.3f}" for c,v in imps.head(5).items()])
-
-                        prompt = f"""You are a senior academic consultant writing a formal institutional report
-for the Head of a Computer Science Department.
-
-IMPORTANT RULES:
-1. Use ONLY the quantitative values provided below — do not invent numbers.
-2. For textbooks, recommend ONLY widely known CS textbooks (e.g., Tanenbaum, CLRS, Silberschatz,
-   Sommerville, Kurose & Ross, Russell & Norvig, Goodfellow et al.). Do NOT invent book titles.
-3. For YouTube channels, recommend ONLY real, well-known channels (e.g., MIT OpenCourseWare,
-   freeCodeCamp, Neso Academy, CS50, 3Blue1Brown). Do NOT invent channel names.
-4. Present findings as evidence-based suggestions — not absolute decisions.
+RULES:
+1. Use ONLY the numbers provided — do not invent values.
+2. Textbooks: ONLY widely known CS books (Tanenbaum, CLRS, Silberschatz, Sommerville,
+   Kurose & Ross, Russell & Norvig, Goodfellow et al.).
+3. YouTube: ONLY real channels (MIT OpenCourseWare, freeCodeCamp, Neso Academy, CS50,
+   3Blue1Brown, Abdul Bari).
+4. Present as evidence-based suggestions — not final decisions.
 
 === STUDENT DATA ({len(df)} students) ===
-Random Forest: Train={len(Xtr)} | Test={len(Xte)} | class_weight={best_cw_label}
-Accuracy={acc*100:.1f}% | Precision={prec*100:.1f}% | Recall={rec*100:.1f}%
-F1={f1*100:.1f}% | CV={cv*100:.1f}% | AUC={f"{auc*100:.1f}%" if auc else "N/A"}
-Thresholds: Weak<{wt} | Average {wt}–{at} | Excellent>{at}
+RF: Train={len(Xtr)} | Test={len(Xte)} | Stratified split | class_weight={best_cw_label}
+Accuracy={acc*100:.1f}% | F1={f1*100:.1f}% | CV={cv*100:.1f}% | AUC={f"{auc*100:.1f}%" if auc else "N/A"}
+LR baseline F1={f1_lr*100:.1f}% | RF advantage={(f1-f1_lr)*100:+.1f}%
+Thresholds: Weak<{wt} | Excellent≥{at}
 Distribution: Weak={cnts.get('Weak',0)} | Average={cnts.get('Average',0)} | Excellent={cnts.get('Excellent',0)}
 
-WEAK COURSES (fail_rate + rf_importance + shap):
+WEAK COURSES (fail_rate + rf_importance + shap + priority_score):
 {weak_str}
 
 MEDIUM COURSES:
@@ -875,49 +993,50 @@ MEDIUM COURSES:
 TOP 5 INFLUENTIAL COURSES (RF Feature Importance):
 {top5_imp}
 
+TOP 3 PRIORITY COURSES (combined score):
+{top3_priority}
+
+EARLY WARNING: {high_risk_n} high-risk students (≥50% Weak probability) in test set.
+
 KMEANS CLUSTERS (k={best_k}, silhouette={best_sil:.3f}):
 {cluster_str}
-
-ALL COURSES IN DATASET:
-{', '.join(course_cols)}
+{market_context}
 
 === REPORT STRUCTURE ===
 
 ## 1. Executive Summary
-3 sentences: key numbers + what clustering revealed.
+3 sentences: key numbers + priority_score ranking + early warning findings.
 
-## 2. Per-Course Analysis
+## 2. Per-Course Analysis (Weak courses only)
 For EACH weak course:
-### [Exact Course Name] | Fail: X% | RF: X.XXX | SHAP: X.XXXX
-- **Root cause:** specific to this course topic
-- **3 Teaching improvements:** course-specific, actionable
-- **Resources:**
-  * YouTube: 2 real named channels for this exact topic
-  * Practice: specific platform + track
-  * Textbook: 1–2 well-known books for this subject
-- **Priority:** Critical / High / Medium
+### [Course Name] | Priority: X.XXX | Fail: X% | SHAP: X.XXXX
+- **Root cause:** specific to this course content
+- **3 Teaching improvements:** actionable, course-specific
+- **Resources:** 2 YouTube channels + 1 practice platform + 1 textbook
+- **Timeline:** short/medium/long term
 
-## 3. Cluster-Based Interventions
-For each cluster: profile, struggle, recommended intervention.
+## 3. Cross-Branch Insight (if market data available)
+Which weak courses map to high-demand market skills? Priority implications.
 
-## 4. SHAP vs Feature Importance
-Any divergence? What does it reveal about the data?
+## 4. Cluster-Based Interventions
+Per cluster: profile, main struggle, recommended action.
 
 ## 5. Priority Action Plan
-Numbered, most urgent first. Include measurable targets."""
+Top 5 actions, numbered, with measurable targets."""
 
                         result = call_groq(groq_key, prompt, max_tokens=3000)
                         st.markdown(result)
                         st.session_state['s1_report'] = result
 
                 if 's1_report' in st.session_state:
-                    result = st.session_state['s1_report']
                     s2 = st.session_state['s1']
                     report_txt = (
                         f"CS DEPARTMENT — STUDENT PERFORMANCE REPORT\n{'='*60}\n\n"
-                        f"Students={len(s2['df'])} | RF F1={s2['f1']*100:.1f}% | "
-                        f"class_weight={s2['best_cw_label']} | Clusters={s2['best_k']}\n\n"
-                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n{result}"
+                        f"Students={len(s2['df'])} | F1={s2['f1']*100:.1f}% | "
+                        f"class_weight={s2['best_cw_label']} | "
+                        f"Clusters={s2['best_k']} | Stratified split\n\n"
+                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n"
+                        f"{st.session_state['s1_report']}"
                     )
                     st.download_button(
                         "📥 Download Student Report",
@@ -953,43 +1072,44 @@ with tab2:
             st.dataframe(jobs_df.head(3))
 
         tcols    = jobs_df.select_dtypes(include='object').columns.tolist()
-        desc_col = st.selectbox("Job description column:", tcols,
-                    index=tcols.index('jobdescription') if 'jobdescription' in tcols else 0)
-        extra    = st.text_input("Extra skills to track (comma-separated):",
-                    placeholder="rust, llm, chatgpt, quantum")
-        curr_in  = st.text_area(
-                    "Current curriculum courses (comma-separated, for gap analysis):",
-                    placeholder="Operating Systems, Databases, Networks, Algorithms, ...",
-                    height=80)
+        desc_col = st.selectbox(
+            "Job description column:", tcols,
+            index=tcols.index('jobdescription') if 'jobdescription' in tcols else 0)
+        extra   = st.text_input(
+            "Extra skills to track (comma-separated):",
+            placeholder="rust, llm, chatgpt, quantum")
+        curr_in = st.text_area(
+            "Current curriculum courses (comma-separated, for gap analysis):",
+            placeholder="Operating Systems, Databases, Networks, Algorithms, ...",
+            height=80)
 
         if st.button("🔍 Run NLP Analysis", key="b2_run"):
 
             with st.spinner("Running TF-IDF pipeline..."):
                 tax = dict(TAXONOMY)
                 if extra.strip():
-                    tax["Custom"] = [s.strip().lower() for s in extra.split(',') if s.strip()]
+                    tax["Custom"] = [s.strip().lower()
+                                     for s in extra.split(',') if s.strip()]
 
                 raw   = jobs_df[desc_col].dropna().tolist()
                 clean = [preprocess(t) for t in raw]
                 atxt  = ' '.join(clean)
 
-                vec   = TfidfVectorizer(ngram_range=(1,3), min_df=1, max_df=0.95, sublinear_tf=True)
-                # min_df=1: نبقي المهارات النادرة من الـ taxonomy (Rust, LLM, etc.)
-                # TF-IDF يعطيهم score منخفض تلقائياً إذا كانوا نادرين جداً
-                tmat  = vec.fit_transform(clean)
+                vec  = TfidfVectorizer(ngram_range=(1,3), min_df=1,
+                                       max_df=0.95, sublinear_tf=True)
+                tmat = vec.fit_transform(clean)
                 fname = vec.get_feature_names_out()
                 tsum  = dict(zip(fname, np.asarray(tmat.sum(axis=0)).flatten()))
 
                 skill_r = {}
                 for cat, skills in tax.items():
                     for s in skills:
-                        sc   = clean_text(s)
-                        # word boundary matching — يمنع "sql" من match داخل "nosql"
+                        sc      = clean_text(s)
                         pattern = r'\b' + re.escape(sc) + r'\b'
-                        freq = len(re.findall(pattern, atxt))
-                        ts   = tsum.get(sc, 0.0)
-                        jw   = sum(1 for t in clean if re.search(pattern, t))
-                        cov  = jw / len(clean) * 100
+                        freq    = len(re.findall(pattern, atxt))
+                        ts      = tsum.get(sc, 0.0)
+                        jw      = sum(1 for t in clean if re.search(pattern, t))
+                        cov     = jw / len(clean) * 100
                         if freq > 0:
                             skill_r[s] = {
                                 'category': cat, 'freq': freq,
@@ -999,10 +1119,11 @@ with tab2:
                                 'bert_sim': None, 'bert_cov': None
                             }
 
-                sorted_s = sorted(skill_r.items(), key=lambda x: x[1]['tfidf_score'], reverse=True)
+                sorted_s = sorted(skill_r.items(),
+                                  key=lambda x: x[1]['tfidf_score'], reverse=True)
                 top30    = sorted_s[:30]
 
-            # Stage 4b: BERT
+            # BERT
             bert_model  = None
             bert_status = "disabled"
             if bert_on:
@@ -1010,8 +1131,8 @@ with tab2:
                     bert_model = load_bert(bert_name)
                 if bert_model:
                     with st.spinner("Computing BERT semantic similarity..."):
-                        sample  = clean[:min(300, len(clean))]
-                        # Cache job embeddings — لا نعيد الحساب لكل مهارة
+                        sample = clean[:min(300, len(clean))]
+
                         @st.cache_data(show_spinner=False)
                         def get_job_embeddings(_model, texts):
                             return _model.encode(texts, batch_size=32,
@@ -1022,16 +1143,16 @@ with tab2:
                             se  = bert_model.encode([s], convert_to_numpy=True)
                             sim = cosine_similarity(se, job_emb)[0]
                             m   = (sim >= bert_threshold).sum()
-                            # max similarity أقوى signal من mean
                             d['bert_sim']     = round(float(sim.mean()), 4)
-                            d['bert_sim_max']  = round(float(sim.max()),  4)
+                            d['bert_sim_max'] = round(float(sim.max()),  4)
                             d['bert_cov']     = round(m / len(sample) * 100, 1)
                     bert_status = f"✅ {bert_name}"
                 else:
                     bert_status = "⚠️ sentence-transformers not installed"
 
             if "✅" in bert_status:
-                st.markdown(f'<div class="bb">🔵 BERT: {bert_status}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="bb">🔵 BERT: {bert_status}</div>',
+                            unsafe_allow_html=True)
             elif "⚠️" in bert_status:
                 st.markdown(
                     f'<div class="ba">🔵 BERT: {bert_status} — '
@@ -1042,28 +1163,26 @@ with tab2:
                 st.markdown(f"""
 | Stage | Action | Detail |
 |-------|--------|--------|
-| Stage 2: Cleanup    | lowercase · URL removal · punctuation (keeps /+#.) | {len(raw):,} texts |
-| Stage 3: Pre-process| tokenize · remove {len(STOP_WORDS)} stop words · min length 2 | |
-| Stage 4a: TF-IDF    | ngram=(1,3) · sublinear_tf · min_df=2 · max_df=0.95 | |
-| Stage 4b: BERT      | Sentence-BERT cosine sim · threshold=0.45 | {bert_status} |
+| Stage 2: Cleanup     | lowercase · URL removal · punctuation (keeps /+#.) | {len(raw):,} texts |
+| Stage 3: Pre-process | tokenize · remove {len(STOP_WORDS)} stop words · min length 2 | |
+| Stage 4a: TF-IDF     | ngram=(1,3) · sublinear_tf · min_df=1 · max_df=0.95 | |
+| Stage 4b: BERT       | Sentence-BERT cosine sim · threshold={bert_threshold} | {bert_status} |
 
-**Why TF-IDF + BERT?**
-TF-IDF: fast, exact keyword frequency (C++ stays C++).
-BERT: semantic matching — "ML engineer" ↔ "machine learning".
-Combined → most complete skill demand signal.
+**min_df=1:** keeps rare but taxonomy-listed skills (Rust, LLM, etc.)
+**word-boundary regex:** prevents "sql" matching inside "nosql"
+**max similarity (not mean):** stronger signal for sparse skill detection
                 """)
 
-            # ── Chart ──
+            # Chart
             names  = [s[0] for s in top30[:20]]
             scores = [s[1]['tfidf_score'] for s in top30[:20]]
             covs   = [s[1]['job_coverage'] for s in top30[:20]]
             cats   = [s[1]['category'] for s in top30[:20]]
             bclrs  = [CAT_COLORS.get(c, '#64748b') for c in cats]
-
             has_bert = any(d['bert_sim'] is not None for _, d in skill_r.items())
 
             if has_bert:
-                bert_s = [skill_r[s[0]]['bert_sim'] or 0 for s in top30[:20]]
+                bert_s = [skill_r[s[0]].get('bert_sim') or 0 for s in top30[:20]]
                 fig_b, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
                 fig_b.patch.set_facecolor('#0f172a')
                 for ax in [ax1, ax2]:
@@ -1073,34 +1192,39 @@ Combined → most complete skill demand signal.
                 bars1 = ax1.barh(names, scores, color=bclrs, height=.6)
                 for b, v, cov in zip(bars1, scores, covs):
                     ax1.text(v+.1, b.get_y()+b.get_height()/2,
-                             f'{v:.1f}|{cov:.0f}%', va='center', fontsize=7, color='#94a3b8')
+                             f'{v:.1f}|{cov:.0f}%',
+                             va='center', fontsize=7, color='#94a3b8')
                 ax1.set_xlabel('TF-IDF Score', color='#94a3b8')
                 ax1.set_title('TF-IDF (Lexical)', color='#f1f5f9', fontsize=10)
                 bars2 = ax2.barh(
                     names, bert_s,
-                    color=['#7c3aed' if v > float(np.mean(bert_s)) else '#334155' for v in bert_s],
-                    height=.6)
+                    color=['#7c3aed' if v > float(np.mean(bert_s)) else '#334155'
+                           for v in bert_s], height=.6)
                 for b, v in zip(bars2, bert_s):
                     ax2.text(v+.001, b.get_y()+b.get_height()/2,
                              f'{v:.3f}', va='center', fontsize=7, color='#94a3b8')
                 ax2.set_xlabel('BERT Avg Similarity', color='#94a3b8')
                 ax2.set_title('BERT (Semantic)', color='#f1f5f9', fontsize=10)
-                plt.suptitle('Top 20 Skills — TF-IDF vs BERT', color='#f1f5f9', fontsize=12)
+                plt.suptitle('Top 20 Skills — TF-IDF vs BERT',
+                             color='#f1f5f9', fontsize=12)
                 plt.tight_layout(); st.pyplot(fig_b); plt.close()
             else:
                 fig_t, ax_t = dark_fig((10, 8))
                 bars_t = ax_t.barh(names, scores, color=bclrs, height=.6)
                 for b, v, cov in zip(bars_t, scores, covs):
                     ax_t.text(v+.1, b.get_y()+b.get_height()/2,
-                              f'{v:.1f} | {cov:.0f}% jobs', va='center', fontsize=7, color='#94a3b8')
-                ax_t.set_xlabel('TF-IDF Score (higher = more important)', color='#94a3b8')
-                ax_t.set_title('Top 20 Skills by TF-IDF Score', color='#f1f5f9', fontsize=11)
-                handles = [mpatches.Patch(color=v, label=k) for k,v in CAT_COLORS.items() if k in cats]
-                ax_t.legend(handles=handles, fontsize=7, facecolor='#0f172a',
-                            labelcolor='#94a3b8', loc='lower right')
+                              f'{v:.1f} | {cov:.0f}% jobs',
+                              va='center', fontsize=7, color='#94a3b8')
+                ax_t.set_xlabel('TF-IDF Score', color='#94a3b8')
+                ax_t.set_title('Top 20 Skills by TF-IDF Score',
+                               color='#f1f5f9', fontsize=11)
+                handles = [mpatches.Patch(color=v, label=k)
+                           for k, v in CAT_COLORS.items() if k in cats]
+                ax_t.legend(handles=handles, fontsize=7,
+                            facecolor='#0f172a', labelcolor='#94a3b8',
+                            loc='lower right')
                 plt.tight_layout(); st.pyplot(fig_t); plt.close()
 
-            # Stats
             sc = st.columns(4)
             for col, (l, v) in zip(sc, [
                 ("Total Jobs",   len(jobs_df)),
@@ -1110,18 +1234,17 @@ Combined → most complete skill demand signal.
             ]):
                 metric_card(col, l, v)
 
-            # Category breakdown
             st.markdown("---")
             st.markdown("#### Demand by Category (TF-IDF weighted)")
             cat_tot = {}
             for _, d in skill_r.items():
                 cat_tot[d['category']] = cat_tot.get(d['category'], 0) + d['tfidf_score']
             tot_all = sum(cat_tot.values()) or 1
-            for cat, total in sorted(cat_tot.items(), key=lambda x: x[1], reverse=True):
+            for cat, total in sorted(cat_tot.items(),
+                                     key=lambda x: x[1], reverse=True):
                 pct = int(total / tot_all * 100)
                 st.progress(pct, text=f"**{cat}** — {total:.1f} ({pct}%)")
 
-            # Full table
             st.markdown("---")
             st.markdown("#### Full Skills Table")
             rows = [{
@@ -1139,27 +1262,24 @@ Combined → most complete skill demand signal.
             if curr_in.strip():
                 st.markdown("---")
                 st.markdown("#### Gap Analysis — Curriculum vs Market")
-                curr_courses = [c.strip() for c in curr_in.split(',') if c.strip()]
-
-                # إذا BERT متاح — نستخدمه للمقارنة الدلالية
-                use_bert_gap = has_bert and bert_model is not None
+                curr_courses   = [c.strip() for c in curr_in.split(',') if c.strip()]
+                use_bert_gap   = has_bert and bert_model is not None
                 if use_bert_gap:
                     curr_embs = bert_model.encode(curr_courses, convert_to_numpy=True)
 
                 gap_rows = []
                 for s, d in top30[:20]:
-                    # طريقة 1: string matching (دائماً)
                     string_match = any(
                         s.lower() in c.lower() or c.lower() in s.lower()
                         for c in curr_courses)
-                    # طريقة 2: BERT semantic match (إذا متاح)
                     if use_bert_gap:
-                        se  = bert_model.encode([s], convert_to_numpy=True)
-                        sim = cosine_similarity(se, curr_embs)[0]
+                        se   = bert_model.encode([s], convert_to_numpy=True)
+                        sim  = cosine_similarity(se, curr_embs)[0]
                         bert_match = float(sim.max()) >= bert_threshold
-                        covered = string_match or bert_match
+                        covered    = string_match or bert_match
                         match_type = ('✅ String' if string_match else
-                                      f'🔵 BERT ({sim.max():.2f})' if bert_match else '❌ Gap')
+                                      f'🔵 BERT ({sim.max():.2f})' if bert_match
+                                      else '❌ Gap')
                     else:
                         covered    = string_match
                         match_type = '✅ Yes' if string_match else '❌ Gap'
@@ -1175,33 +1295,30 @@ Combined → most complete skill demand signal.
                 st.dataframe(gdf, use_container_width=True, hide_index=True)
                 n_gaps = sum(1 for r in gap_rows if '❌' in r['In Curriculum'])
                 g1, g2 = st.columns(2)
-                g1.metric("Skills with Gap", n_gaps,             delta_color="inverse")
+                g1.metric("Skills with Gap", n_gaps, delta_color="inverse")
                 g2.metric("Skills Covered",  len(gap_rows)-n_gaps)
-                if use_bert_gap:
-                    st.caption("🔵 BERT semantic matching active — "
-                               "'machine learning' can match 'ML' or 'AI Engineering'")
 
-            # ══ حفظ نتائج Tab 2 في session_state ══
+            # حفظ في session_state
             st.session_state['s2'] = {
-                'jobs_n':    len(jobs_df),
-                'skill_r':   skill_r,
-                'top30':     top30,
-                'cat_tot':   cat_tot,
-                'tot_all':   tot_all,
-                'has_bert':  has_bert,
+                'jobs_n':      len(jobs_df),
+                'skill_r':     skill_r,
+                'top30':       top30,
+                'cat_tot':     cat_tot,
+                'tot_all':     tot_all,
+                'has_bert':    has_bert,
                 'bert_status': bert_status,
-                'curr_in':   curr_in,
+                'curr_in':     curr_in,
             }
             st.success("✅ NLP analysis complete — scroll down to generate the AI report.")
 
-        # ── AI REPORT — خارج if b2_run عشان ما يختفي ──
+        # ── AI REPORT Tab 2 ──
         if 's2' in st.session_state:
             s2 = st.session_state['s2']
             st.markdown("---")
             st.markdown("#### 🤖 AI Report — Job Market & Curriculum")
             st.markdown(
-                '<div class="bb">Generates a curriculum gap analysis based on computed TF-IDF/BERT results. '
-                '<b>Treat output as a decision-support draft</b> — verify with domain experts.</div>',
+                '<div class="bb">Generates curriculum gap analysis based on '
+                'TF-IDF/BERT results. <b>Treat as decision-support draft.</b></div>',
                 unsafe_allow_html=True)
 
             if not groq_key:
@@ -1231,51 +1348,61 @@ Combined → most complete skill demand signal.
                         bert_note = ""
                         if has_bert:
                             top3b = sorted(
-                                [(s, d['bert_sim']) for s,d in skill_r.items() if d['bert_sim']],
+                                [(s, d['bert_sim']) for s, d in skill_r.items()
+                                 if d['bert_sim']],
                                 key=lambda x: x[1], reverse=True)[:5]
-                            bert_note = (f"\nTOP 5 BY BERT SEMANTIC SIMILARITY: "
-                                         f"{', '.join([f'{s}({v:.3f})' for s,v in top3b])}")
+                            bert_note = (
+                                f"\nTOP 5 BY BERT: "
+                                f"{', '.join([f'{s}({v:.3f})' for s,v in top3b])}")
 
-                        prompt_j = f"""You are a senior academic consultant writing a formal curriculum analysis
-report for the Head of a Computer Science Department.
+                        # ربط مع Branch A إذا متاح
+                        student_context = ""
+                        if 's1' in st.session_state:
+                            s1_data = st.session_state['s1']
+                            weak_courses = list(s1_data.get('wc', {}).keys())
+                            top3_priority = list(s1_data.get('course_priority', {}).items())
+                            top3_priority.sort(key=lambda x: x[1], reverse=True)
+                            student_context = f"""
+=== STUDENT PERFORMANCE DATA (from Branch A) ===
+Weak courses: {weak_courses}
+Top priority courses: {[c for c, _ in top3_priority[:3]]}
+CROSS-BRANCH: Link market skill gaps to academically weak courses for urgency ranking.
+"""
 
-IMPORTANT RULES:
-1. Use the numbers below accurately — do not invent data.
-2. For textbooks: ONLY widely known CS books (Tanenbaum, CLRS, Silberschatz, etc.).
-3. For YouTube: ONLY real channels (MIT OCW, freeCodeCamp, CS50, Neso Academy, etc.).
-4. Present as evidence-based suggestions for expert review.
+                        prompt_j = f"""You are a senior academic consultant writing a formal
+curriculum analysis report for a CS Department Head.
 
-=== JOB MARKET DATA ({s2['jobs_n']} listings — TF-IDF + BERT NLP) ===
-TOP 20 IN-DEMAND SKILLS:
+RULES: Use provided numbers only. Real textbooks/YouTube only. Evidence-based suggestions.
+
+=== JOB MARKET ({s2['jobs_n']} listings) ===
+TOP 20 SKILLS:
 {top20_str}
 {bert_note}
 
-DEMAND BY CATEGORY (TF-IDF weighted):
+DEMAND BY CATEGORY:
 {cat_str}
 
 CURRENT CURRICULUM: {curr_str}
+{student_context}
 
 === REPORT STRUCTURE ===
 
 ## 1. Market Overview
-What dominates? Any TF-IDF vs BERT divergence worth noting?
+Dominant categories, TF-IDF vs BERT divergences.
 
 ## 2. Per-Skill Analysis (Top 10)
-For each of the top 10 skills:
 ### [Skill] — TF-IDF: X | Coverage: X%
-- Why in demand, industry context
-- How to teach: 2 YouTube channels + 1 practice platform + 1 textbook
+- Industry context + how to teach + resources
 
-## 3. Curriculum–Market Gap Analysis
-- Skills with HIGH demand NOT in curriculum (with TF-IDF scores)
-- Skills PARTIALLY covered (need strengthening)
-- Estimated curriculum coverage % of top 20 skills
+## 3. Curriculum–Market Gap
+- High-demand skills NOT in curriculum (with TF-IDF scores)
+- Curriculum coverage % of top 20 skills
 
 ## 4. Recommended New Courses (4–5)
-Each: name · skills covered (TF-IDF scores) · placement (Year/Semester) · Priority
+Name · skills covered · placement · Priority
 
 ## 5. Priority Action Plan
-Numbered, most urgent first. Include measurable targets."""
+Top 5, numbered, measurable targets."""
 
                         result_j = call_groq(groq_key, prompt_j, max_tokens=3000)
                         st.session_state['s2_report'] = result_j
@@ -1283,11 +1410,11 @@ Numbered, most urgent first. Include measurable targets."""
                 if 's2_report' in st.session_state:
                     st.markdown(st.session_state['s2_report'])
                     s2r = st.session_state['s2']
-                    top20_str_dl = "\n".join([
+                    top20_dl = "\n".join([
                         f"- {s} ({d['category']}): TF-IDF={d['tfidf_score']:.1f}"
                         for s, d in s2r['top30'][:20]
                     ])
-                    cat_str_dl = "\n".join([
+                    cat_dl = "\n".join([
                         f"- {cat}: {tot:.1f}"
                         for cat, tot in sorted(
                             s2r['cat_tot'].items(), key=lambda x: x[1], reverse=True)
@@ -1296,8 +1423,9 @@ Numbered, most urgent first. Include measurable targets."""
                         f"CS DEPARTMENT — JOB MARKET REPORT\n{'='*60}\n\n"
                         f"Jobs={s2r['jobs_n']} | Skills={len(s2r['skill_r'])} | "
                         f"BERT={s2r['bert_status']}\n\n"
-                        f"TOP SKILLS:\n{top20_str_dl}\n\nCATEGORIES:\n{cat_str_dl}\n\n"
-                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n{st.session_state['s2_report']}"
+                        f"TOP SKILLS:\n{top20_dl}\n\nCATEGORIES:\n{cat_dl}\n\n"
+                        f"{'='*60}\nAI REPORT\n{'='*60}\n\n"
+                        f"{st.session_state['s2_report']}"
                     )
                     st.download_button(
                         "📥 Download Job Market Report",
